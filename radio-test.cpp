@@ -55,7 +55,9 @@ int main(int argc, char* argv[]) {
     string request = "GET " + path + " HTTP/1.0\r\n";
     request += "Host: " + host + "\r\n";
     request += "User-Agent: Simple-SHOUTcast-Client/1.0\r\n";
-    request += "Connection: Keep-Alive\r\n\r\n";
+    request += "Connection: Keep-Alive\r\n";
+    request += "Icy-MetaData: 1\r\n\r\n";
+
 
     if (write(sock, request.c_str(), request.length()) < 0) {
         cerr << "Blad: Nie mozna wyslac zadania" << endl;
