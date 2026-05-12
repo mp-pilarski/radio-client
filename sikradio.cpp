@@ -4,12 +4,14 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdexcept>
-#include <sys/_types/_ssize_t.h>
 #include <unistd.h>
 #include <string>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <iostream>
+#include <map>
+#include <sstream>
+
 
 #include "common.h"
 
@@ -18,6 +20,7 @@ struct SiteInfo {
     std::string host;
     std::string port;
     std::string path;
+    //MAYBE: co z ?args='?'
 };
 
 struct ClientConfig {
@@ -27,6 +30,58 @@ struct ClientConfig {
     int ip_version = AF_UNSPEC;
     int verbosity = 2;
 };
+
+struct HTTPResponse {
+    int status_code;
+    std::string status_msg;
+    std::map<std::string, std::string> headers;
+
+    // Metoda do wyciągania wartości nagłówków
+    std::string get_header(const std::string& key) const {
+        auto it = headers.find(key);
+        return it != headers.end() ? it->second : "";
+    }
+};
+
+void trim(std::string& s) {
+    s.erase(0, s.find_first_not_of(" \t\r\n"));
+    s.erase(s.find_last_not_of(" \t\r\n") + 1);
+}
+
+HTTPResponse parseHttpResponse(const std::string& raw_input){
+    HTTPResponse response{};
+    std::istringstream stream(raw_input);
+    std::string line;
+
+    // Pierwsza linia to Wersja i status
+    if(std::getline(stream, line)){
+        trim(line);
+        size_t space1 = line.find(' ');
+        size_t space2 = line.find(' ', space1 + 1);
+
+        if (space1 != std::string::npos && space2 != std::string::npos) {
+            response.status_code = std::stoi(line.substr(space1 + 1, space2 - space1 - 1));
+            response.status_msg = line.substr(space2 + 1);
+        }
+    }
+
+    // Kolejne linie to wartości pól
+    while(std::getline(stream, line)){
+        //TODO: przyciac linie
+        trim(line);
+        if(line.empty()) continue;
+        size_t colon_pos = line.find(':');
+        if(colon_pos != std::string::npos){
+            std::string key = line.substr(0, colon_pos);
+            std::string val = line.substr(colon_pos + 1);
+            trim(key);
+            trim(val);
+            response.headers[key] = val;
+        }
+    }
+
+    return response;
+}
 
 SiteInfo parseUrl(std::string& url){
     //Parsowanie URL -> później wydzielić do common
@@ -133,7 +188,7 @@ private:
     }
 
     //TODO: wyeksportować do common? porównać z kodem z labów
-    ssize_t robust_read(char* buf, size_t len) {
+    ssize_t safe_read(char* buf, size_t len) {
         ssize_t res;
         do {
             //if (conn.is_https) res = SSL_read(conn.ssl, buf, len);
@@ -142,11 +197,11 @@ private:
         return res;
     }
 
-    //TODO: sens czytania tylko jednej linii?
+    //TODO: sens czytania tylko jednej linii? DO USUNIECIA!
     std::string read_http_line() {
         std::string line;
         char c;
-        while (robust_read(&c, 1) == 1) {
+        while (safe_read(&c, 1) == 1) {
             line += c;
             if (line.size() >= 2 && line.substr(line.size() - 2) == "\r\n") {
                 return line.substr(0, line.size() - 2);
@@ -220,8 +275,45 @@ public:
         std::cerr << "wysyłam:\n" << request << "\n";
         safe_send(request);
 
-        std::string status_line = read_http_line();
-        std::cerr << "odebrano: " << status_line << "\n";
+        //TODO: inna funkcja?
+        std::string buffer;
+        char chunk[4096];
+        size_t header_end_pos = std::string::npos;
+        while (true) {
+            ssize_t bytes_read = recv(fd, chunk, sizeof(chunk), 0);
+            if (bytes_read <= 0) {
+                throw std::runtime_error("Błąd połączenia podczas czytania nagłówków");
+            }
+
+            buffer.append(chunk, bytes_read);
+
+            // Szukamy podwójnego znaku nowej linii (koniec nagłówków)
+            header_end_pos = buffer.find("\r\n\r\n");
+            if (header_end_pos != std::string::npos) {
+                break;
+            }
+        }
+        // Dzielimy bufor na dwie części:
+        // 1. Nagłówki (od początku do końca \r\n\r\n)
+        std::string raw_headers = buffer.substr(0, header_end_pos);
+        // 2. Reszta (początek muzyki), którą musimy oddać do głównej pętli!
+        std::string leftover_audio = buffer.substr(header_end_pos + 4);
+        //TODO: koniec innej funkcji
+
+        std::cerr << raw_headers << "\n";
+        HTTPResponse response = parseHttpResponse(raw_headers);
+        if(response.status_code == 200){
+            std::cerr << "OK\n";
+            //TODO: Kwestia plików cookie
+        }else{
+            //TODO: obsługa innych odpowiedzi
+            std::cerr << "Inny kod\n";
+        }
+
+        // Skonfigurować poll
+        // 1. socket -> audio z metadanymi
+        // 2. stdin -> przerwanie od użytkownika
+
 
     }
 
