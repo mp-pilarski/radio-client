@@ -4,6 +4,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdexcept>
+#include <sys/types.h>
 #include <unistd.h>
 #include <string>
 #include <sys/socket.h>
@@ -11,6 +12,7 @@
 #include <iostream>
 #include <map>
 #include <sstream>
+#include <poll.h>
 
 
 #include "common.h"
@@ -29,6 +31,12 @@ struct ClientConfig {
     uint16_t timeout_ms = 5000; //MAYBE: zmienić na inny typ
     int ip_version = AF_UNSPEC;
     int verbosity = 2;
+};
+
+enum State {
+    AUDIO,
+    META_LEN,
+    META_BODY
 };
 
 struct HTTPResponse {
@@ -166,6 +174,7 @@ class RadioClient {
 private:
     ClientConfig config;
     int fd = -1;
+    std::string stdin_buffer; //FIXME: ??
 
     //TODO: wyeksportować do common? porównać z kodem z labów
     bool safe_send(const std::string& data){
@@ -277,10 +286,11 @@ public:
 
         //TODO: inna funkcja?
         std::string buffer;
-        char chunk[4096];
+        char chunk[4096]; //FIXME: STAŁE
         size_t header_end_pos = std::string::npos;
         while (true) {
             ssize_t bytes_read = recv(fd, chunk, sizeof(chunk), 0);
+            std::cerr << bytes_read << "\n";
             if (bytes_read <= 0) {
                 throw std::runtime_error("Błąd połączenia podczas czytania nagłówków");
             }
@@ -296,7 +306,7 @@ public:
         // Dzielimy bufor na dwie części:
         // 1. Nagłówki (od początku do końca \r\n\r\n)
         std::string raw_headers = buffer.substr(0, header_end_pos);
-        // 2. Reszta (początek muzyki), którą musimy oddać do głównej pętli!
+        // 2. Reszta (początek muzyki), którą musimy oddać do głównej pętli (?)
         std::string leftover_audio = buffer.substr(header_end_pos + 4);
         //TODO: koniec innej funkcji
 
@@ -309,11 +319,97 @@ public:
             //TODO: obsługa innych odpowiedzi
             std::cerr << "Inny kod\n";
         }
-
         // Skonfigurować poll
         // 1. socket -> audio z metadanymi
         // 2. stdin -> przerwanie od użytkownika
+        //TODO: zastosować stałe zamiast indeksów
+        pollfd fds[2];
+        fds[0].fd = fd;
+        fds[0].events = POLLIN;
+        fds[0].revents = 0;
 
+        fds[1].fd = STDIN_FILENO;
+        fds[1].events = POLLIN;
+        fds[1].revents = 0;
+
+        char buf[8192]; //FIXME: STAŁE
+        std::string meta_int_key = response.get_header("icy-metaint");
+        std::cerr << meta_int_key << "\n";
+        size_t meta_int = 0;
+        if(meta_int_key != ""){
+            meta_int = std::stoi(meta_int_key);
+        }else{
+            std::cerr << "brak klucza\n";
+        }
+        State state = State::AUDIO;
+        size_t counter_to_meta = meta_int;
+        std::string meta_buffer;
+        bool reconnect = false;
+        while(!reconnect){
+            int p = poll(fds, 2, config.timeout_ms);
+
+            //TODO: obsługa timeoutu
+
+            // Wejście od użytkownika
+            if(fds[1].revents & (POLLIN | POLLERR)){
+                fds[1].revents = 0;
+                char ch;
+                while (read(STDIN_FILENO, &ch, 1) > 0) {
+                    stdin_buffer += ch;
+                    if (stdin_buffer.find("quit\n") != std::string::npos) {
+                        std::cerr << "Zakończono przez użytkwnika quit";
+                        exit(0);
+                    }
+                }
+            }
+
+            // audio
+            if(fds[0].revents & (POLLIN | POLLERR)){
+                fds[0].revents = 0;
+                ssize_t bytes_read = safe_read(buf, 8192);
+                std::cerr << bytes_read << "\n";
+                //std::cout << buf;
+                size_t i = 0;
+                while(i < bytes_read){
+                    if(meta_int == 0){
+                        ssize_t to_write = bytes_read - i;
+                        write(STDOUT_FILENO, buf + i, to_write);
+                        i += to_write;
+                    } else {
+                        if(state == State::AUDIO) {
+                            size_t to_write = std::min((size_t)bytes_read - i, counter_to_meta);
+                            write(STDOUT_FILENO, buf + i, to_write);
+                            i += to_write;
+                            counter_to_meta -= to_write;
+                            if(counter_to_meta == 0) state = State::META_LEN;
+                        }
+                        else if(state == State::META_LEN) {
+                            char meta_len = buf[i++];
+                            counter_to_meta = meta_len * 16;
+                            if(counter_to_meta == 0){
+                                state = State::AUDIO;
+                                counter_to_meta = meta_int;
+                            }else{
+                                state = State::META_BODY;
+                                meta_buffer.clear();
+                            }
+                        }else{
+                            size_t to_write = std::min((size_t)bytes_read - i, counter_to_meta);
+                            meta_buffer.append(buf + i, to_write);
+                            i += to_write;
+                            counter_to_meta -= to_write;
+
+                            if(counter_to_meta == 0){
+                                std::cerr.write(meta_buffer.data(), meta_buffer.size());
+
+                                state = State::AUDIO;
+                                counter_to_meta = meta_int;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
     }
 
