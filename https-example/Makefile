@@ -10,9 +10,10 @@ TARGET = sikradio
 
 all: $(TARGET)
 
-$(TARGET): $(TARGET).o common.o
+$(TARGET): $(TARGET).o common.o connection.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
+connection.o: connection.cpp connection.h
 common.o: common.cpp common.h
 sikradio.o: sikradio.cpp common.h
 

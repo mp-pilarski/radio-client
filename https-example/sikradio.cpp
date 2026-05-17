@@ -15,12 +15,14 @@
 #include <map>
 #include <sstream>
 #include <poll.h>
+#include <memory>
 
 #include <openssl/bio.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
 #include "common.h"
+#include "connection.h"
 
 struct SiteInfo {
     std::string type; //HTTP lub HTTPS (może powinno to być coś innego?)
@@ -178,74 +180,9 @@ ClientConfig parse_arguments(int argc, char *argv[]){
 class RadioClient {
 private:
     ClientConfig config;
-    int fd = -1;
     std::string stdin_buffer; //FIXME: ??
-    SSL* ssl;
-    SSL_CTX *ctx;
 
-    //TODO: wyeksportować do common? porównać z kodem z labów
-    bool safe_send(const std::string& data){
-        size_t total_sent = 0;
-        size_t len = data.length();
-        const char* buf = data.c_str();
-
-        while(total_sent < len){
-            ssize_t sent;
-            //TODO: obsługa https
-            sent = send(fd, buf + total_sent, len - total_sent, 0);
-
-            if(sent <= 0){
-                if(errno == EINTR) continue;
-                return false;
-            }
-            total_sent += sent;
-        }
-        return true;
-    }
-
-    int ssl_write_all(SSL* my_ssl, const std::string& data) {
-        size_t total = 0;
-        size_t len = data.length();
-        const char* buf = data.c_str();\
-
-        while(total < len){
-            size_t n_written = 0;
-            if(!SSL_write_ex(my_ssl, buf + total, len - total, &n_written)){
-                int err = SSL_get_error(my_ssl, 0);
-                if(err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
-                    continue;
-                }
-                return -1;
-            }
-            total += n_written;
-        }
-        return (int)total;
-    }
-
-    //TODO: wyeksportować do common? porównać z kodem z labów
-    ssize_t safe_read(char* buf, size_t len) {
-        ssize_t res;
-        do {
-            //if (conn.is_https) res = SSL_read(conn.ssl, buf, len);
-            res = recv(fd, buf, len, 0);
-        } while (res < 0 && errno == EINTR);
-        return res;
-    }
-
-    //TODO: sens czytania tylko jednej linii? DO USUNIECIA!
-    std::string read_http_line() {
-        std::string line;
-        char c;
-        while (safe_read(&c, 1) == 1) {
-            line += c;
-            if (line.size() >= 2 && line.substr(line.size() - 2) == "\r\n") {
-                return line.substr(0, line.size() - 2);
-            }
-        }
-        return line;
-    }
-
-    void serverConnect(){
+    std::unique_ptr<Connection> serverConnect(){
         //połaczenie do serwera -> też kolejna funkcja
         addrinfo hints{}, *res, *rp;
         hints.ai_family = config.ip_version;
@@ -255,9 +192,9 @@ private:
         int err = getaddrinfo(config.url.host.c_str(), config.url.port.c_str(), &hints, &res);
         if(err != 0){
             std::cerr << "Bład nawiazania polaczenia: " << std::string(gai_strerror(err));
-            return;
+            throw std::runtime_error("Błąd nawiązania połaczenia " + std::string(gai_strerror(err)));
         }
-        fd = -1;
+        int fd = -1;
         char ipstr[INET6_ADDRSTRLEN];
         //TODO: czy to powinna być pętla?
         for(rp = res; rp != nullptr; rp = rp->ai_next){
@@ -291,47 +228,17 @@ private:
         }
         freeaddrinfo(res);
         std::cerr << "połączono!\n";
-        //TODO: kwestie HTTPS?
-        // jest już zwykły socket, robimy do niego warstwę TLS
-        //
-        // tworzenie contextu
-        ctx = SSL_CTX_new(TLS_client_method());
-        // odrzucenie połączenia jeśli weryfikacja certyfikatu kończy się niepowodzeniem
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
-        // użycie domyślnego zestawu zaufanych certyfikatów
-        if(!SSL_CTX_set_default_verify_paths(ctx)){
-            throw std::runtime_error("Failed to set the default trusted certificate store\n"); //FIXME: może inny rodzaj wyjątku + teraz jest wyciek
-            exit(1);
-        }
-        //MAYBE: ustawienie minimalnej wersji protokołu
-        ssl = SSL_new(ctx);
-        if(ssl == nullptr){
-            throw std::runtime_error("Failed to create the SSL object\n"); //FIXME: może inny rodzaj wyjątku + teraz jest wyciek
-            exit(1);
-        }
-
-        // połączenie ssl z fd
-        SSL_set_fd(ssl, fd);
-
-        if(!SSL_set_tlsext_host_name(ssl, config.url.host.c_str())) {
-            throw std::runtime_error("Failed to set the certificate verification hostname\n"); //FIXME: może inny rodzaj wyjątku + teraz jest wyciek
-            exit(1);
-        }
-
-        if(SSL_connect(ssl) < 1){
-            std::cerr << "Failed to connect to the server\n";
-            if (SSL_get_verify_result(ssl) != X509_V_OK){
-                printf("Verify error: %s\n", X509_verify_cert_error_string(SSL_get_verify_result(ssl)));
-                exit(1); //FIXME: problem z wyciekiem
-            }
-        }
+        //TODO: utworzenie odpowiedniego connection!
+        return (config.url.type == "https") ?
+        std::unique_ptr<Connection>(new HttpsConnection(fd, config.url.host.c_str())) :
+        std::unique_ptr<Connection>(new HttpConnection(fd));
     }
 
 public:
     RadioClient(const ClientConfig& cfg) : config(cfg) {}
 
     void run(){
-        serverConnect();
+        auto conn = serverConnect();
         std::string request = "GET " + config.url.path + " HTTP/1.1\r\n";
         request += "Host: " + config.url.host + "\r\n";
         request += "Connection: Keep-Alive\r\n"; //TODO: czy tak ma być zawsze?
@@ -341,7 +248,8 @@ public:
         //TODO: kwestia cookie
         request += "\r\n";
         std::cerr << "wysyłam:\n" << request << "\n";
-        ssl_write_all(ssl, request);
+        //ssl_write_all(ssl, request);
+        conn->writen(request);
 
         //TODO: inna funkcja?
         std::string buffer;
@@ -349,8 +257,7 @@ public:
         size_t header_end_pos = std::string::npos;
         while (true) {
             //ssize_t bytes_read = recv(fd, chunk, sizeof(chunk), 0);
-            size_t bytes_read;
-            SSL_read_ex(ssl, chunk, sizeof(chunk), &bytes_read);
+            size_t bytes_read = conn->read(chunk, sizeof(chunk));
             std::cerr << bytes_read << "\n";
             if (bytes_read <= 0) {
                 throw std::runtime_error("Błąd połączenia podczas czytania nagłówków");
@@ -387,7 +294,7 @@ public:
         // 2. stdin -> przerwanie od użytkownika
         //TODO: zastosować stałe zamiast indeksów oraz wydzielić część kodu do osobnej funkcji
         pollfd fds[2];
-        fds[0].fd = fd;
+        fds[0].fd = conn->get_fd();
         fds[0].events = POLLIN;
         fds[0].revents = 0;
 
@@ -410,7 +317,7 @@ public:
         std::string meta_buffer;
         bool reconnect = false;
         while(!reconnect){
-            int pending = SSL_pending(ssl);
+            int pending = conn->has_pending_data();
             int timeout = (pending > 0) ? 0 : timeout;
             int p = poll(fds, 2, config.timeout_ms);
 
@@ -434,79 +341,52 @@ public:
                 fds[0].revents = 0;
                 //ssize_t bytes_read = safe_read(buf, 8192);
                 //std::cerr << bytes_read << "\n";
-
+                //
                 while(true) {
                     size_t written;
-                    int n  = SSL_read_ex(ssl, buf, sizeof(buf), &written);
+                    int n  = conn->readn(buf, sizeof(buf));
+                    //write(STDOUT_FILENO, buf, n);
 
-                    if(n > 0) {
-                        write(STDOUT_FILENO, buf, written);
-                        if(SSL_pending(ssl) == 0) break;
-                        continue;
+                    size_t i = 0;
+                    while(i < n){
+                        if(meta_int == 0) {
+                            ssize_t to_write = n - i;
+                            write(STDOUT_FILENO, buf+i, to_write);
+                            i += to_write;
+                        } else {
+                            if(state == State::AUDIO) {
+                                size_t to_write = std::min((size_t)n - i, counter_to_meta);
+                                write(STDOUT_FILENO, buf + i, to_write);
+                                i += to_write;
+                                counter_to_meta -= to_write;
+                                if(counter_to_meta == 0) state = State::META_LEN;
+                            }
+                            else if(state == State::META_LEN) {
+                                char meta_len = buf[i++];
+                                counter_to_meta = meta_len * 16;
+                                if(counter_to_meta == 0){
+                                    state = State::AUDIO;
+                                    counter_to_meta = meta_int;
+                                }else{
+                                    state = State::META_BODY;
+                                    meta_buffer.clear();
+                                }
+                            }else{
+                                size_t to_write = std::min((size_t)n - i, counter_to_meta);
+                                meta_buffer.append(buf + i, to_write);
+                                i += to_write;
+                                counter_to_meta -= to_write;
+                                if(counter_to_meta == 0){
+                                    std::cerr.write(meta_buffer.data(), meta_buffer.size());
+                                    state = State::AUDIO;
+                                    counter_to_meta = meta_int;
+                                }
+                            }
+                        }
                     }
-
-                    int err = SSL_get_error(ssl, n);
-                    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-                        // Normalny stan – SSL potrzebuje więcej danych z sieci
-                        break;
-                    }
-                    if (err == SSL_ERROR_ZERO_RETURN) {
-                        printf("Serwer zamknął połączenie TLS\n");
-                        return;
-                    }
-                    // Błąd krytyczny
-                    fprintf(stderr, "SSL_read error: %d\n", err);
-                    ERR_print_errors_fp(stderr);
-                    return;
                 }
-                //std::cout << buf;
-                // size_t i = 0;
-                // while(i < bytes_read){
-                //     if(meta_int == 0){
-                //         ssize_t to_write = bytes_read - i;
-                //         write(STDOUT_FILENO, buf + i, to_write);
-                //         i += to_write;
-                //     } else {
-                //         if(state == State::AUDIO) {
-                //             size_t to_write = std::min((size_t)bytes_read - i, counter_to_meta);
-                //             write(STDOUT_FILENO, buf + i, to_write);
-                //             i += to_write;
-                //             counter_to_meta -= to_write;
-                //             if(counter_to_meta == 0) state = State::META_LEN;
-                //         }
-                //         else if(state == State::META_LEN) {
-                //             char meta_len = buf[i++];
-                //             counter_to_meta = meta_len * 16;
-                //             if(counter_to_meta == 0){
-                //                 state = State::AUDIO;
-                //                 counter_to_meta = meta_int;
-                //             }else{
-                //                 state = State::META_BODY;
-                //                 meta_buffer.clear();
-                //             }
-                //         }else{
-                //             size_t to_write = std::min((size_t)bytes_read - i, counter_to_meta);
-                //             meta_buffer.append(buf + i, to_write);
-                //             i += to_write;
-                //             counter_to_meta -= to_write;
-
-                //             if(counter_to_meta == 0){
-                //                 std::cerr.write(meta_buffer.data(), meta_buffer.size());
-
-                //                 state = State::AUDIO;
-                //                 counter_to_meta = meta_int;
-                //             }
-                //         }
-                //     }
             }
         }
-        int ret = SSL_shutdown(ssl);
-        if (ret < 1) {
-            //FIXME: trzeba dokładnie przeczytać jaka wartość jest tutaj oczekiwana
-           printf("Error shutting down\n");
-        }
-        SSL_free(ssl);
-        SSL_CTX_free(ctx);
     }
 
 };
