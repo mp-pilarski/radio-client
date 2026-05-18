@@ -1,6 +1,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <openssl/buffer.h>
@@ -16,6 +17,7 @@
 #include <sstream>
 #include <poll.h>
 #include <memory>
+#include <fcntl.h>
 
 #include <openssl/bio.h>
 #include <openssl/ssl.h>
@@ -37,7 +39,7 @@ struct ClientConfig {
     SiteInfo url;
     std::string url_string;
     bool request_metadata = false;
-    uint16_t timeout_ms = 5000; //MAYBE: zmienić na inny typ
+    uint32_t timeout_ms = 5000; //MAYBE: zmienić na inny typ
     int ip_version = AF_UNSPEC;
     int verbosity = 2;
 };
@@ -101,57 +103,24 @@ HTTPResponse parseHttpResponse(const std::string& raw_input){
 }
 
 SiteInfo parseUrl(std::string& url){
-    // //Parsowanie URL -> później wydzielić do common
-    // // FIXME: obsługa błędów? co z kropkowanymi adresami np. 123.13.3.11
-    // std::string protocol, domain, port, path;
-    // size_t pos = url.find("://");
-    // protocol = url.substr(0, pos);
-    // size_t start = pos + 3;
-
-    // size_t pathPos = url.find('/', start);
-    // std::string hostPort;
-    // if(pathPos == std::string::npos){
-    //     hostPort = url.substr(start);
-    //     path = "/";
-    // }else{
-    //     hostPort = url.substr(start, pathPos - start);
-    //     path = url.substr(pathPos);
-    // }
-    // size_t portPos = hostPort.find(":");
-    // if(portPos == std::string::npos){
-    //     domain = hostPort;
-    //     port = (protocol == "https") ? "443" : "80";
-    // }else{
-    //     domain = hostPort.substr(0, portPos);
-    //     port = hostPort.substr(portPos + 1);
-    // }
-
-    // size_t argsStart = path.find("?");
-    // if(argsStart != std::string::npos){
-    //     std::string args = path.substr(argsStart);
-
-    // }
-
-    // std::cout << "Protokol: " << protocol << "\n";
-    // std::cout << "Domena:   " << domain << "\n";
-    // std::cout << "Port:     " << port << "\n";
-    // std::cout << "Sciezka:  " << path << "\n";
-    // return SiteInfo {protocol, domain, port, path};
     SiteInfo result;
-
+    //TODO: usprawnić!
+    std::cerr << "url: " << url << "\n";
+    // Wycięcie fragmentu po # i zignorowanie go
     std::string temp = url;
     auto hash_pos = url.find('#');
     if(hash_pos != std::string::npos) {
-        // wyciąganie fragmentu i zignorowanie go
         temp = temp.substr(0, hash_pos);
     }
 
-    auto question_pos = temp.find('?');
-    if(question_pos != std::string::npos){
-        //TODO: rozbić na queries?
-        temp = temp.substr(0, hash_pos);
-    }
+    // MAYBE: czy odcinać queries od path?
+    // auto question_pos = temp.find('?');
+    // if(question_pos != std::string::npos){
+    //     //TODO: rozbić na queries?
+    //     temp = temp.substr(0, hash_pos);
+    // }
 
+    // Wyciągnięcie scheme
     auto colon_pos = temp.find(':');
     auto slash_pos = temp.find('/');
 
@@ -174,14 +143,27 @@ SiteInfo parseUrl(std::string& url){
         }
 
         //MAYBE: co z authority jako adresem IPv6 lub IPv4
+        if(!authority.empty() && authority[0] == '['){
+            auto bracket_end = authority.find(']');
+            if(bracket_end != std::string::npos){
+                result.host = authority.substr(1, bracket_end-1);
+                authority = authority.substr(bracket_end+1);
 
-        auto port_colon = temp.find(':');
-        if(port_colon != std::string::npos) {
-            result.host = temp.substr(0, port_colon);
-            result.port = temp.substr(port_colon+1);
-        }else{
-            result.host = authority;
-            result.port = (result.scheme == "https") ? "443" : "80";
+                if(!authority.empty() && authority[0] == ':'){
+                    result.port = authority.substr(1);
+                }
+
+            }
+        }else {
+            // Wyciągnięcie portu
+            auto port_colon = authority.find(':');
+            if(port_colon != std::string::npos) {
+                result.host = authority.substr(0, port_colon);
+                result.port = authority.substr(port_colon+1);
+            }else{
+                result.host = authority;
+                result.port = (result.scheme == "https") ? "443" : "80";
+            }
         }
     }
     std::cerr << "Protokol: " << result.scheme << "\n";
@@ -277,7 +259,7 @@ private:
             }
             // convert the IP to a string and print it:
             inet_ntop(rp->ai_family, addr, ipstr, sizeof ipstr);
-            printf(" %s: %s\n", ipver, ipstr);
+            //printf(" %s: %s\n", ipver, ipstr);
 
             fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
             if(fd == -1) continue;
@@ -290,7 +272,11 @@ private:
         }
         freeaddrinfo(res);
         std::cerr << "połączono!\n";
-        //TODO: utworzenie odpowiedniego connection!
+        if(fd == -1) throw std::runtime_error("brak serwera");
+        //fcntl(fd, F_SETFL, O_NONBLOCK);
+        // timeval tv { 0, config.timeout_ms };
+        // setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        // setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         return (config.url.scheme == "https") ?
         std::unique_ptr<Connection>(new HttpsConnection(fd, config.url.host.c_str())) :
         std::unique_ptr<Connection>(new HttpConnection(fd));
@@ -319,31 +305,39 @@ public:
         conn->writen(request);
 
         //TODO: inna funkcja?
-        std::string buffer;
+        std::string buffer = "";
         char chunk[4096]; //FIXME: STAŁE
         size_t header_end_pos = std::string::npos;
-        while (true) {
+        std::cerr << "poczatek czytania nagłówków\n";
+        bool in_headers = true;
+        while (in_headers) {
             //ssize_t bytes_read = recv(fd, chunk, sizeof(chunk), 0);
-            size_t bytes_read = conn->read(chunk, sizeof(chunk));
-            std::cerr << bytes_read << "\n";
-            if (bytes_read <= 0) {
-                throw std::runtime_error("Błąd połączenia podczas czytania nagłówków");
-            }
+            // ssize_t bytes_read = conn->read(chunk, sizeof(chunk));
+            // std::cerr << "bytes_read: " << bytes_read << "\n";
+            // if (bytes_read <= 0) {
+            //     throw std::runtime_error("Błąd połączenia podczas czytania nagłówków");
+            // }
 
-            buffer.append(chunk, bytes_read);
+            // buffer.append(chunk, bytes_read);
+            // // Szukamy podwójnego znaku nowej linii (koniec nagłówków)
+            // header_end_pos = buffer.find("\r\n\r\n");
+            // if (header_end_pos != std::string::npos) {
+            //     break;
+            // }
+            char c;
+            ssize_t res = conn->read(&c, 1);
+            if(res < 0) throw std::runtime_error("Błąd podczas czytania nagłówków");
+            buffer += c;
 
-            // Szukamy podwójnego znaku nowej linii (koniec nagłówków)
-            header_end_pos = buffer.find("\r\n\r\n");
-            if (header_end_pos != std::string::npos) {
-                break;
+            if(buffer.length() >= 4 && buffer.substr(buffer.length() - 4) == "\r\n\r\n"){
+                in_headers = false;
             }
         }
+        std::cerr << "koniec czytania nagłówków\n";
         // Dzielimy bufor na dwie części:
         // 1. Nagłówki (od początku do końca \r\n\r\n)
-        std::string raw_headers = buffer.substr(0, header_end_pos);
+        std::string raw_headers = buffer;
         // 2. Reszta (początek muzyki), którą musimy oddać do głównej pętli (?)
-        std::string leftover_audio = buffer.substr(header_end_pos + 4);
-        //TODO: koniec innej funkcji
 
         std::cerr << "response:\n";
         std::cerr << raw_headers << "\n";
@@ -394,36 +388,42 @@ public:
         bool reconnect = false;
         while(!reconnect){
             int pending = conn->has_pending_data();
-            int timeout = (pending > 0) ? 0 : timeout;
-            int p = poll(fds, 2, config.timeout_ms);
+            int timeout = (pending > 0) ? 0 : config.timeout_ms;
+            int p = poll(fds, 2, timeout);
 
             //TODO: obsługa timeoutu
-            if(p < 0 && errno == EINTR){
-                std::cerr << "EINTR\n";
-                continue;
-            }
-            if(p < 0){
-                throw std::runtime_error("Bład poll");
-            }
             if(p == 0 && !conn->has_pending_data()){
                 std::cerr << "timeout\n";
+                reconnect = true;
                 break;
             }
 
             // Wejście od użytkownika
             if(fds[1].revents & (POLLIN | POLLERR)){
-                std::cerr << "input z stdin\n";
-                fds[1].revents = 0;
-                char ch;
-                //TODO: tutaj źle
-                while (read(STDIN_FILENO, &ch, 1) > 0) {
-                    stdin_buffer += ch;
-                    if (stdin_buffer.find("quit\n") != std::string::npos) {
-                        std::cerr << "Zakończono przez użytkwnika quit";
+                // std::cerr << "input z stdin\n";
+                // fds[1].revents = 0;
+                // char ch;
+                // //TODO: tutaj źle
+                // read(STDIN_FILENO, buf, sizeof(buf));
+
+                // while (read(STDIN_FILENO, &ch, 1) > 0) {
+                //     stdin_buffer += ch;
+                //     if (stdin_buffer.find("quit\n") != std::string::npos) {
+                //         std::cerr << "Zakończono przez użytkwnika quit";
+                //         exit(0);
+                //     }
+                // }
+                // std::cerr << "koniec z stdin\n";
+                char buf[128];
+                ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+                if(n > 0){
+                    stdin_buffer.append(buf, n);
+                    if(stdin_buffer.find("quit") != std::string::npos){
+                        std::cerr << "Odczytano quit -> zakończono przez użytkownika\n";
                         exit(0);
                     }
+                    if(stdin_buffer.length() > 1024) stdin_buffer.clear();
                 }
-                std::cerr << "koniec z stdin\n";
             }
 
             // audio
@@ -433,7 +433,14 @@ public:
                 //std::cerr << bytes_read << "\n";
                 //
                     size_t written;
-                    int n  = conn->readn(buf, sizeof(buf));
+                    ssize_t n  = conn->read(buf, sizeof(buf));
+                    if(n == 0){
+                        exit(0);
+                    } else if(n < 0){
+                        std::cerr << "blad strumienia";
+                        reconnect = true;
+                        break;
+                    }
                     //write(STDOUT_FILENO, buf, n);
                     std::cerr << "input z socketa: " << n << "\n";
                     size_t i = 0;
@@ -451,7 +458,7 @@ public:
                                 if(counter_to_meta == 0) state = State::META_LEN;
                             }
                             else if(state == State::META_LEN) {
-                                char meta_len = buf[i++];
+                                unsigned char meta_len = buf[i++];
                                 counter_to_meta = meta_len * 16;
                                 if(counter_to_meta == 0){
                                     state = State::AUDIO;
@@ -484,22 +491,27 @@ public:
 };
 
 int main(int argc, char *argv[]){
-    ClientConfig config = parse_arguments(argc, argv); //FIXME: obsługa wyjątków
-    if(config.request_metadata){
-        std::cout << "requested metadata\n";
-    }else{
-        std::cout << "NOT requested metadata\n";
+    try{
+        ClientConfig config = parse_arguments(argc, argv); //FIXME: obsługa wyjątków
+        // if(config.request_metadata){
+        //     std::cout << "requested metadata\n";
+        // }else{
+        //     std::cout << "NOT requested metadata\n";
+        // }
+        // std::cout << "config.timeout " << config.timeout_ms << "\n";
+        // std::cout << "config.verbosity " << config.verbosity << "\n";
+        // if(config.ip_version == AF_UNSPEC){
+        //     std:: cout << "unspecified ip version\n";
+        // }else if(config.ip_version == AF_INET){
+        //     std:: cout << "ipv4\n";
+        // }else{
+        //     std::cout << "ipv6\n";
+        // }
+        RadioClient client(config);
+        client.run();
+    } catch(const std::exception &e){
+        std::cerr << e.what() << "\n";
+        return 1;
     }
-    std::cout << "config.timeout " << config.timeout_ms << "\n";
-    std::cout << "config.verbosity " << config.verbosity << "\n";
-    if(config.ip_version == AF_UNSPEC){
-        std:: cout << "unspecified ip version\n";
-    }else if(config.ip_version == AF_INET){
-        std:: cout << "ipv4\n";
-    }else{
-        std::cout << "ipv6\n";
-    }
-    RadioClient client(config);
-    client.run();
     return 0;
 }

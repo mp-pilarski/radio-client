@@ -20,6 +20,7 @@ HttpConnection::~HttpConnection() {
 }
 
 ssize_t HttpConnection::read(char *buffer, size_t n) {
+    //TODO: zły error handling!
     return recv(fd, buffer, n, 0);
 }
 
