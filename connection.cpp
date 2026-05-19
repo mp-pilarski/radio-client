@@ -21,7 +21,12 @@ HttpConnection::~HttpConnection() {
 
 ssize_t HttpConnection::read(char *buffer, size_t n) {
     //TODO: zły error handling!
-    return recv(fd, buffer, n, 0);
+    //return recv(fd, buffer, n, 0);
+    ssize_t res;
+    do {
+        res = recv(fd, buffer, n, 0);
+    } while(res < 0 && errno == EINTR);
+    return res;
 }
 
 // ssize_t HttpConnection::readn(char *buffer, size_t len) {
@@ -63,13 +68,11 @@ HttpsConnection::HttpsConnection(int socket_fd, const char *host) : fd(socket_fd
       // użycie domyślnego zestawu zaufanych certyfikatów
       if(!SSL_CTX_set_default_verify_paths(ctx)){
           throw std::runtime_error("Failed to set the default trusted certificate store\n"); //FIXME: może inny rodzaj wyjątku + teraz jest wyciek
-          exit(1);
       }
       //MAYBE: ustawienie minimalnej wersji protokołu
       ssl = SSL_new(ctx);
       if(ssl == nullptr){
           throw std::runtime_error("Failed to create the SSL object\n"); //FIXME: może inny rodzaj wyjątku + teraz jest wyciek
-          exit(1);
       }
 
       // połączenie ssl z fd
@@ -77,14 +80,12 @@ HttpsConnection::HttpsConnection(int socket_fd, const char *host) : fd(socket_fd
 
       if(!SSL_set_tlsext_host_name(ssl, host)) {
           throw std::runtime_error("Failed to set the certificate verification hostname\n"); //FIXME: może inny rodzaj wyjątku + teraz jest wyciek
-          exit(1);
       }
 
       if(SSL_connect(ssl) < 1){
           std::cerr << "Failed to connect to the server\n";
           if (SSL_get_verify_result(ssl) != X509_V_OK){
               printf("Verify error: %s\n", X509_verify_cert_error_string(SSL_get_verify_result(ssl)));
-              exit(1); //FIXME: problem z wyciekiem
           }
       }
   }
@@ -100,7 +101,9 @@ HttpsConnection::~HttpsConnection() {
 
 ssize_t HttpsConnection::read(char *buffer, size_t n){
     size_t res;
-    SSL_read_ex(ssl, buffer, n, &res);
+    if(SSL_read_ex(ssl, buffer, n, &res) < 0){
+        return -1;
+    }
     return static_cast<ssize_t>(res);
 }
 
@@ -126,11 +129,12 @@ bool HttpsConnection::writen(const std::string &data) {
               if(err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
                   continue;
               }
-              return -1;
+              return false; //-1
           }
           total += n_written;
       }
-      return (int)total;
+      //return (int)total;
+      return true;
   }
 
   int HttpsConnection::get_fd() const { return fd; }

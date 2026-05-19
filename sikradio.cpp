@@ -1,6 +1,8 @@
+#include <cctype>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <iterator>
 #include <netdb.h>
@@ -24,16 +26,17 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <vector>
+#include <algorithm>
 
 #include "common.h"
 #include "connection.h"
 
 struct SiteInfo {
-    std::string scheme; //HTTP lub HTTPS (może powinno to być coś innego?)
+    std::string scheme;
     std::string host;
     std::string port;
     std::string path;
-    std::vector<std::pair<std::string, std::string>> queries;
+    bool customPort = false;
 };
 
 struct ClientConfig {
@@ -96,6 +99,7 @@ HTTPResponse parseHttpResponse(const std::string& raw_input){
             std::string val = line.substr(colon_pos + 1);
             trim(key);
             trim(val);
+            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c){ return std::tolower(c);});
             response.headers[key] = val;
         }
     }
@@ -143,7 +147,6 @@ SiteInfo parseUrl(std::string& url){
             result.path = "/";
         }
 
-        //MAYBE: co z authority jako adresem IPv6 lub IPv4
         if(!authority.empty() && authority[0] == '['){
             auto bracket_end = authority.find(']');
             if(bracket_end != std::string::npos){
@@ -152,6 +155,7 @@ SiteInfo parseUrl(std::string& url){
 
                 if(!authority.empty() && authority[0] == ':'){
                     result.port = authority.substr(1);
+                    result.customPort = true;
                 }
 
             }
@@ -161,6 +165,7 @@ SiteInfo parseUrl(std::string& url){
             if(port_colon != std::string::npos) {
                 result.host = authority.substr(0, port_colon);
                 result.port = authority.substr(port_colon+1);
+                result.customPort = true;
             }else{
                 result.host = authority;
                 result.port = (result.scheme == "https") ? "443" : "80";
@@ -231,6 +236,19 @@ private:
     size_t meta_int;
     State state = State::AUDIO;
 
+    ssize_t safe_stdout_write(char* buf, size_t n){
+        ssize_t written = 0;
+        while(written < n) {
+            ssize_t res = write(STDOUT_FILENO, buf + written, n - written);
+            if(res < 0){
+                if(errno == EINTR) continue;
+                throw std::runtime_error("Blad zapisu do STDOUT");
+            }
+            written += res;
+        }
+        return written;
+    }
+
     //TODO: argument zamienić na wektor
     //TODO: osobny obiekt?
     void parseAudio(char *buf, ssize_t n){
@@ -238,14 +256,15 @@ private:
         while(i < n) {
             if(meta_int == 0){
                 ssize_t to_write = n-i;
-                write(STDOUT_FILENO, buf + i, to_write);
-                i += to_write;
+                //write(STDOUT_FILENO, buf + i, to_write);
+                i += safe_stdout_write(buf+i, to_write);
             } else {
                 if(state == State::AUDIO){
                     size_t to_write = std::min((size_t)n - i, chars_to_meta);
-                    write(STDOUT_FILENO, buf + i, to_write);
-                    i += to_write;
-                    chars_to_meta -= to_write;
+                    //write(STDOUT_FILENO, buf + i, to_write);
+                    ssize_t written = safe_stdout_write(buf + i, to_write);
+                    i += written;
+                    chars_to_meta -= written;
                     if(chars_to_meta == 0) state = State::META_LEN;
                 } else if(state == State::META_LEN){
                     unsigned char meta_len = buf[i++];
@@ -339,8 +358,13 @@ public:
         while(true){
             SiteInfo url = parseUrl(current_url);
         auto conn = serverConnect();
-        std::string request = "GET " + url.path + " HTTP/1.1\r\n";
-        request += "Host: " + url.host + "\r\n";
+        std::string request = "GET " + url.path;
+        request += " HTTP/1.1\r\n";
+        request += "Host: " + url.host;
+        if(url.customPort){
+            request += ":" + url.port;
+        }
+        request += "\r\n";
         request += "Connection: Keep-Alive\r\n"; //TODO: czy tak ma być zawsze?
         if(config.request_metadata){
             request += "Icy-MetaData: 1\r\n";
@@ -375,19 +399,22 @@ public:
         std::cerr << raw_headers << "\n";
         HTTPResponse response = parseHttpResponse(raw_headers);
 
-        std::string temp_cookie = response.get_header("Set-Cookie");
+        std::string temp_cookie = response.get_header("set-cookie");
         if (!temp_cookie.empty()) cookie = temp_cookie.substr(0, temp_cookie.find(';'));
         if(response.status_code == 200){
             std::cerr << "OK\n";
         }else if(response.status_code >= 300 && response.status_code < 400){
             std::cerr << "redirect\n";
-            std::string loc = response.get_header("Location");
+            std::string loc = response.get_header("location");
             current_url = loc;
+            if(current_url == ""){
+                throw std::runtime_error("Serwer wysłał redirect ale nie podał nowej lokalizacji");
+            }
             continue;
         }else{
             //TODO: obsługa innych odpowiedzi
             std::cerr << "Inny kod: " << response.status_code << "\n";
-            exit(0);
+            throw std::runtime_error("Serwer rzucił nieznany kod błędu");
         }
 
         // Skonfigurować poll
@@ -408,13 +435,18 @@ public:
         std::cerr << meta_int_key << "\n";
         meta_int = 0;
         if(meta_int_key != ""){
-            meta_int = std::stoi(meta_int_key);
+            try {
+                meta_int = std::stoi(meta_int_key);
+            } catch (const std::exception& e){
+                std::cerr << "bład podczas czytania icy-metaint\n";
+            }
         }else{
             std::cerr << "brak metaint\n";
         }
         chars_to_meta = meta_int;
+        state = State::AUDIO;
+        meta_buffer.clear();
 
-        //State state = State::AUDIO;
         bool reconnect = false;
         while(!reconnect){
             int pending = conn->has_pending_data();
