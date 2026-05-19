@@ -15,7 +15,7 @@ $(TARGET): $(TARGET).o common.o connection.o
 
 connection.o: connection.cpp connection.h
 common.o: common.cpp common.h
-sikradio.o: sikradio.cpp common.h
+sikradio.o: sikradio.cpp common.h connection.h
 
 clean:
 	rm -f $(TARGET) *.o *~

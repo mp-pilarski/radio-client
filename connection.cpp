@@ -24,13 +24,13 @@ ssize_t HttpConnection::read(char *buffer, size_t n) {
     return recv(fd, buffer, n, 0);
 }
 
-ssize_t HttpConnection::readn(char *buffer, size_t len) {
-      ssize_t res;
-      do {
-          res = recv(fd, buffer, len, 0);
-      } while(res < 0 && errno == EINTR);
-      return res;
-}
+// ssize_t HttpConnection::readn(char *buffer, size_t len) {
+//       ssize_t res;
+//       do {
+//           res = recv(fd, buffer, len, 0);
+//       } while(res < 0 && errno == EINTR);
+//       return res;
+// }
 
 bool HttpConnection::writen(const std::string &data) {
     size_t total_sent = 0;
@@ -104,15 +104,15 @@ ssize_t HttpsConnection::read(char *buffer, size_t n){
     return static_cast<ssize_t>(res);
 }
 
-ssize_t HttpsConnection::readn(char *buffer, size_t n) {
-      //TODO: to nie ma sensu!
-      // size_t res;
-      // do {
-      //     res = SSL_read_ex(ssl, buffer, n, &res);
-      // } while(res < 0 && errno == EINTR);
-      // return res;
-      return read(buffer, n);
-}
+// ssize_t HttpsConnection::readn(char *buffer, size_t n) {
+//       //TODO: to nie ma sensu!
+//       // size_t res;
+//       // do {
+//       //     res = SSL_read_ex(ssl, buffer, n, &res);
+//       // } while(res < 0 && errno == EINTR);
+//       // return res;
+//       return read(buffer, n);
+// }
 
 bool HttpsConnection::writen(const std::string &data) {
       size_t total = 0;

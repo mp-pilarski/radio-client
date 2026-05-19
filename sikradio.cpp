@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <iterator>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <openssl/buffer.h>
@@ -225,6 +226,53 @@ class RadioClient {
 private:
     ClientConfig config;
     std::string stdin_buffer; //FIXME: ??
+    std::string meta_buffer = "";
+    size_t chars_to_meta;
+    size_t meta_int;
+    State state = State::AUDIO;
+
+    //TODO: argument zamienić na wektor
+    //TODO: osobny obiekt?
+    void parseAudio(char *buf, ssize_t n){
+        ssize_t i = 0;
+        while(i < n) {
+            if(meta_int == 0){
+                ssize_t to_write = n-i;
+                write(STDOUT_FILENO, buf + i, to_write);
+                i += to_write;
+            } else {
+                if(state == State::AUDIO){
+                    size_t to_write = std::min((size_t)n - i, chars_to_meta);
+                    write(STDOUT_FILENO, buf + i, to_write);
+                    i += to_write;
+                    chars_to_meta -= to_write;
+                    if(chars_to_meta == 0) state = State::META_LEN;
+                } else if(state == State::META_LEN){
+                    unsigned char meta_len = buf[i++];
+                    chars_to_meta = meta_len * 16;
+                    if(chars_to_meta == 0){
+                        state = State::AUDIO;
+                        chars_to_meta = meta_int;
+                    }else{
+                        state = State::META_BODY;
+                        meta_buffer.clear();
+                    }
+                } else {
+                    size_t to_write = std::min((size_t)n - i, chars_to_meta);
+                    meta_buffer.append(buf + i, to_write);
+                    i += to_write;
+                    chars_to_meta -= to_write;
+                    if(chars_to_meta == 0){
+                        std::cerr << "metadata\n";
+                        std::cerr.write(meta_buffer.data(), meta_buffer.size());
+                        std::cerr.write("\n", 1);
+                        state = State::AUDIO;
+                        chars_to_meta = meta_int;
+                    }
+                }
+            }
+        }
+    }
 
     std::unique_ptr<Connection> serverConnect(){
         //połaczenie do serwera -> też kolejna funkcja
@@ -304,26 +352,13 @@ public:
         //ssl_write_all(ssl, request);
         conn->writen(request);
 
-        //TODO: inna funkcja?
+        //TODO: inna funkcja? czytanie po jednym znaku nie jest wydajne
         std::string buffer = "";
-        char chunk[4096]; //FIXME: STAŁE
+        //char chunk[4096]; //FIXME: STAŁE
         size_t header_end_pos = std::string::npos;
         std::cerr << "poczatek czytania nagłówków\n";
         bool in_headers = true;
         while (in_headers) {
-            //ssize_t bytes_read = recv(fd, chunk, sizeof(chunk), 0);
-            // ssize_t bytes_read = conn->read(chunk, sizeof(chunk));
-            // std::cerr << "bytes_read: " << bytes_read << "\n";
-            // if (bytes_read <= 0) {
-            //     throw std::runtime_error("Błąd połączenia podczas czytania nagłówków");
-            // }
-
-            // buffer.append(chunk, bytes_read);
-            // // Szukamy podwójnego znaku nowej linii (koniec nagłówków)
-            // header_end_pos = buffer.find("\r\n\r\n");
-            // if (header_end_pos != std::string::npos) {
-            //     break;
-            // }
             char c;
             ssize_t res = conn->read(&c, 1);
             if(res < 0) throw std::runtime_error("Błąd podczas czytania nagłówków");
@@ -334,10 +369,7 @@ public:
             }
         }
         std::cerr << "koniec czytania nagłówków\n";
-        // Dzielimy bufor na dwie części:
-        // 1. Nagłówki (od początku do końca \r\n\r\n)
         std::string raw_headers = buffer;
-        // 2. Reszta (początek muzyki), którą musimy oddać do głównej pętli (?)
 
         std::cerr << "response:\n";
         std::cerr << raw_headers << "\n";
@@ -347,7 +379,6 @@ public:
         if (!temp_cookie.empty()) cookie = temp_cookie.substr(0, temp_cookie.find(';'));
         if(response.status_code == 200){
             std::cerr << "OK\n";
-            //TODO: Kwestia plików cookie
         }else if(response.status_code >= 300 && response.status_code < 400){
             std::cerr << "redirect\n";
             std::string loc = response.get_header("Location");
@@ -372,19 +403,18 @@ public:
         fds[1].events = POLLIN;
         fds[1].revents = 0;
 
-        char buf[8192]; //FIXME: STAŁE i lepiej vector
+        char buf_c[8192]; //FIXME: STAŁE i lepiej vector
         std::string meta_int_key = response.get_header("icy-metaint");
         std::cerr << meta_int_key << "\n";
-        size_t meta_int = 0;
+        meta_int = 0;
         if(meta_int_key != ""){
             meta_int = std::stoi(meta_int_key);
         }else{
             std::cerr << "brak metaint\n";
         }
+        chars_to_meta = meta_int;
 
-        State state = State::AUDIO;
-        size_t counter_to_meta = meta_int;
-        std::string meta_buffer;
+        //State state = State::AUDIO;
         bool reconnect = false;
         while(!reconnect){
             int pending = conn->has_pending_data();
@@ -400,20 +430,6 @@ public:
 
             // Wejście od użytkownika
             if(fds[1].revents & (POLLIN | POLLERR)){
-                // std::cerr << "input z stdin\n";
-                // fds[1].revents = 0;
-                // char ch;
-                // //TODO: tutaj źle
-                // read(STDIN_FILENO, buf, sizeof(buf));
-
-                // while (read(STDIN_FILENO, &ch, 1) > 0) {
-                //     stdin_buffer += ch;
-                //     if (stdin_buffer.find("quit\n") != std::string::npos) {
-                //         std::cerr << "Zakończono przez użytkwnika quit";
-                //         exit(0);
-                //     }
-                // }
-                // std::cerr << "koniec z stdin\n";
                 char buf[128];
                 ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
                 if(n > 0){
@@ -429,11 +445,8 @@ public:
             // audio
             if((fds[0].revents & (POLLIN | POLLERR)) || pending > 0){
                 fds[0].revents = 0;
-                //ssize_t bytes_read = safe_read(buf, 8192);
-                //std::cerr << bytes_read << "\n";
-                //
                     size_t written;
-                    ssize_t n  = conn->read(buf, sizeof(buf));
+                    ssize_t n  = conn->read(buf_c, sizeof(buf_c));
                     if(n == 0){
                         exit(0);
                     } else if(n < 0){
@@ -441,47 +454,8 @@ public:
                         reconnect = true;
                         break;
                     }
-                    //write(STDOUT_FILENO, buf, n);
                     std::cerr << "input z socketa: " << n << "\n";
-                    size_t i = 0;
-                    while(i < n){
-                        if(meta_int == 0) {
-                            ssize_t to_write = n - i;
-                            write(STDOUT_FILENO, buf+i, to_write);
-                            i += to_write;
-                        } else {
-                            if(state == State::AUDIO) {
-                                size_t to_write = std::min((size_t)n - i, counter_to_meta);
-                                write(STDOUT_FILENO, buf + i, to_write);
-                                i += to_write;
-                                counter_to_meta -= to_write;
-                                if(counter_to_meta == 0) state = State::META_LEN;
-                            }
-                            else if(state == State::META_LEN) {
-                                unsigned char meta_len = buf[i++];
-                                counter_to_meta = meta_len * 16;
-                                if(counter_to_meta == 0){
-                                    state = State::AUDIO;
-                                    counter_to_meta = meta_int;
-                                }else{
-                                    state = State::META_BODY;
-                                    meta_buffer.clear();
-                                }
-                            }else{
-                                size_t to_write = std::min((size_t)n - i, counter_to_meta);
-                                meta_buffer.append(buf + i, to_write);
-                                i += to_write;
-                                counter_to_meta -= to_write;
-                                if(counter_to_meta == 0){
-                                    std::cerr << "metadata\n";
-                                    std::cerr.write(meta_buffer.data(), meta_buffer.size());
-                                    std::cerr.write("\n", 1);
-                                    state = State::AUDIO;
-                                    counter_to_meta = meta_int;
-                                }
-                            }
-                        }
-                }
+                    parseAudio(buf_c, n);
                     std::cerr << "koniec inputu z socketa\n";
             }
         }
@@ -492,21 +466,7 @@ public:
 
 int main(int argc, char *argv[]){
     try{
-        ClientConfig config = parse_arguments(argc, argv); //FIXME: obsługa wyjątków
-        // if(config.request_metadata){
-        //     std::cout << "requested metadata\n";
-        // }else{
-        //     std::cout << "NOT requested metadata\n";
-        // }
-        // std::cout << "config.timeout " << config.timeout_ms << "\n";
-        // std::cout << "config.verbosity " << config.verbosity << "\n";
-        // if(config.ip_version == AF_UNSPEC){
-        //     std:: cout << "unspecified ip version\n";
-        // }else if(config.ip_version == AF_INET){
-        //     std:: cout << "ipv4\n";
-        // }else{
-        //     std::cout << "ipv6\n";
-        // }
+        ClientConfig config = parse_arguments(argc, argv);
         RadioClient client(config);
         client.run();
     } catch(const std::exception &e){
