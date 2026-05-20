@@ -71,6 +71,13 @@ void trim(std::string& s) {
     s.erase(s.find_last_not_of(" \t\r\n") + 1);
 }
 
+std::string prepareForGetAddr(std::string& s){
+    if(s[0] == '[' && s.back() == ']'){
+        return s.substr(1, s.length()-2);
+    }
+    return s;
+}
+
 HTTPResponse parseHttpResponse(const std::string& raw_input){
     HTTPResponse response{};
     std::istringstream stream(raw_input);
@@ -150,7 +157,7 @@ SiteInfo parseUrl(std::string& url){
         if(!authority.empty() && authority[0] == '['){
             auto bracket_end = authority.find(']');
             if(bracket_end != std::string::npos){
-                result.host = authority.substr(1, bracket_end-1);
+                result.host = authority.substr(0, bracket_end+1);
                 authority = authority.substr(bracket_end+1);
 
                 if(!authority.empty() && authority[0] == ':'){
@@ -293,14 +300,15 @@ private:
         }
     }
 
-    std::unique_ptr<Connection> serverConnect(){
+    std::unique_ptr<Connection> serverConnect(SiteInfo url){
         //połaczenie do serwera -> też kolejna funkcja
         addrinfo hints{}, *res, *rp;
         hints.ai_family = config.ip_version;
         hints.ai_socktype = SOCK_STREAM;
 
         //FIXME: to jest brzydkie!
-        int err = getaddrinfo(config.url.host.c_str(), config.url.port.c_str(), &hints, &res);
+        std::cerr << prepareForGetAddr(url.host) << "\n";
+        int err = getaddrinfo(prepareForGetAddr(url.host).c_str(), url.port.c_str(), &hints, &res);
         if(err != 0){
             std::cerr << "Bład nawiazania polaczenia: " << std::string(gai_strerror(err));
             throw std::runtime_error("Błąd nawiązania połaczenia " + std::string(gai_strerror(err)));
@@ -331,6 +339,12 @@ private:
             fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
             if(fd == -1) continue;
 
+            timeval tv;
+            tv.tv_sec = config.timeout_ms / 1000;
+            tv.tv_usec = (config.timeout_ms % 1000) * 1000;
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
             if(connect(fd, rp->ai_addr, rp->ai_addrlen) != -1){
                 break;
             }
@@ -344,8 +358,8 @@ private:
         // timeval tv { 0, config.timeout_ms };
         // setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         // setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        return (config.url.scheme == "https") ?
-        std::unique_ptr<Connection>(new HttpsConnection(fd, config.url.host.c_str())) :
+        return (url.scheme == "https") ?
+        std::unique_ptr<Connection>(new HttpsConnection(fd, url.host.c_str())) :
         std::unique_ptr<Connection>(new HttpConnection(fd));
     }
 
@@ -357,7 +371,7 @@ public:
         std::string cookie;
         while(true){
             SiteInfo url = parseUrl(current_url);
-        auto conn = serverConnect();
+        auto conn = serverConnect(url);
         std::string request = "GET " + url.path;
         request += " HTTP/1.1\r\n";
         request += "Host: " + url.host;
@@ -387,6 +401,7 @@ public:
             ssize_t res = conn->read(&c, 1);
             if(res < 0) throw std::runtime_error("Błąd podczas czytania nagłówków");
             buffer += c;
+            //std::cerr << c << "\n";
 
             if(buffer.length() >= 4 && buffer.substr(buffer.length() - 4) == "\r\n\r\n"){
                 in_headers = false;
@@ -453,25 +468,34 @@ public:
             int timeout = (pending > 0) ? 0 : config.timeout_ms;
             int p = poll(fds, 2, timeout);
 
-            //TODO: obsługa timeoutu
-            if(p == 0 && !conn->has_pending_data()){
+            if(p < 0) {
+                if(errno == EINTR) continue;
+                throw std::runtime_error("Blad krytyczny poll()");
+            }
+
+            if(p == 0 && pending == 0){
                 std::cerr << "timeout\n";
                 reconnect = true;
                 break;
             }
 
             // Wejście od użytkownika
-            if(fds[1].revents & (POLLIN | POLLERR)){
+            if(fds[1].fd != -1 && fds[1].revents & (POLLIN | POLLERR)){
+                fds[1].revents = 0;
                 char buf[128];
                 ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
                 if(n > 0){
                     stdin_buffer.append(buf, n);
                     if(stdin_buffer.find("quit") != std::string::npos){
                         std::cerr << "Odczytano quit -> zakończono przez użytkownika\n";
+                        //return;
                         exit(0);
                     }
                     if(stdin_buffer.length() > 1024) stdin_buffer.clear();
-                }
+                } else if(n == 0){
+                    //zakończenie strumienia STDIN
+                    fds[1].fd = -1;
+                }//TODO: inne przypadki do error handlingu
             }
 
             // audio
@@ -481,11 +505,14 @@ public:
                     ssize_t n  = conn->read(buf_c, sizeof(buf_c));
                     if(n == 0){
                         exit(0);
+                        // std::cerr << "serwer zamknal strumien\n";
+                        // reconnect = true;
+                        // break;
                     } else if(n < 0){
                         std::cerr << "blad strumienia";
                         reconnect = true;
                         break;
-                    }
+                    } //TODO: inne przypadki do error handlingu
                     std::cerr << "input z socketa: " << n << "\n";
                     parseAudio(buf_c, n);
                     std::cerr << "koniec inputu z socketa\n";
