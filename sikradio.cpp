@@ -116,7 +116,7 @@ HTTPResponse parseHttpResponse(const std::string& raw_input){
 
 SiteInfo parseUrl(std::string& url){
     SiteInfo result;
-    //TODO: usprawnić!
+    //TODO: usprawnić! + szerszy error handling!
     std::cerr << "url: " << url << "\n";
     // Wycięcie fragmentu po # i zignorowanie go
     std::string temp = url;
@@ -316,7 +316,6 @@ private:
     }
 
     std::unique_ptr<Connection> serverConnect(SiteInfo url){
-        //połaczenie do serwera -> też kolejna funkcja
         addrinfo hints{}, *res, *rp;
         hints.ai_family = config.ip_version;
         hints.ai_socktype = SOCK_STREAM;
@@ -378,6 +377,93 @@ private:
         std::unique_ptr<Connection>(new HttpConnection(fd));
     }
 
+    //jakaś lepsza nazwa?
+    std::unique_ptr<Connection> handleConnectionStart(){
+        std::string current_url = config.url_string;
+        std::string cookie;
+        bool redirect = true;
+        std::unique_ptr<Connection> conn = nullptr;
+        while(redirect){
+            redirect = false;
+            SiteInfo url = parseUrl(current_url);
+            conn = serverConnect(url);
+
+            // Przygotowanie requestu
+            std::string request = "GET " + url.path;
+            request += " HTTP/1.1\r\n";
+            request += "Host: " + url.host;
+            if(url.customPort){
+                request += ":" + url.port;
+            }
+            request += "\r\n";
+            request += "Connection: Keep-Alive\r\n";
+            if(config.request_metadata){
+                request += "Icy-MetaData: 1\r\n";
+            }
+            if(!cookie.empty()) request += "Cookie: " + cookie + "\r\n";
+            request += "\r\n";
+
+            std::cerr << "wysyłam:\n" << request << "\n";
+            conn->writen(request);
+
+            //TODO: czytanie po jednym znaku nie jest wydajne, brak wsparcia dla quit oraz obslugi timeoutu
+            std::string buffer = "";
+            //char chunk[4096]; //FIXME: STAŁE
+            size_t header_end_pos = std::string::npos;
+            std::cerr << "poczatek czytania nagłówków\n";
+            bool in_headers = true;
+            while (in_headers) {
+                char c;
+                ssize_t res = conn->read(&c, 1);
+                if(res < 0) throw std::runtime_error("Błąd podczas czytania nagłówków");
+                buffer += c;
+                //std::cerr << c << "\n";
+
+                if(buffer.length() >= 4 && buffer.substr(buffer.length() - 4) == "\r\n\r\n"){
+                    in_headers = false;
+                }
+            }
+            std::cerr << "koniec czytania nagłówków\n";
+            std::string raw_headers = buffer;
+
+            std::cerr << "response:\n";
+            std::cerr << raw_headers << "\n";
+            HTTPResponse response = parseHttpResponse(raw_headers);
+
+            std::string temp_cookie = response.get_header("set-cookie");
+            if (!temp_cookie.empty()) cookie = temp_cookie.substr(0, temp_cookie.find(';'));
+            if(response.status_code == 200){
+                std::cerr << "OK\n";
+            }else if(response.status_code >= 300 && response.status_code < 400){
+                std::cerr << "redirect\n";
+                std::string loc = response.get_header("location");
+                current_url = loc;
+                if(current_url == ""){
+                    throw std::runtime_error("Serwer wysłał redirect ale nie podał nowej lokalizacji");
+                }
+                redirect = true;
+                continue;
+            }else{
+                //TODO: obsługa innych odpowiedzi
+                std::cerr << "Inny kod: " << response.status_code << "\n";
+                throw std::runtime_error("Serwer rzucił nieznany kod błędu");
+            }
+            std::string meta_int_key = response.get_header("icy-metaint");
+            std::cerr << meta_int_key << "\n";
+            meta_int = 0;
+            if(meta_int_key != ""){
+                try {
+                    meta_int = std::stoi(meta_int_key);
+                } catch (const std::exception& e){
+                    std::cerr << "bład podczas czytania icy-metaint\n";
+                }
+            }else{
+                std::cerr << "brak metaint\n";
+            }
+        }
+        return conn;
+    }
+
 public:
     RadioClient(const ClientConfig& cfg) : config(cfg) {}
 
@@ -385,67 +471,7 @@ public:
         std::string current_url = config.url_string;
         std::string cookie;
         while(true){
-            SiteInfo url = parseUrl(current_url);
-        auto conn = serverConnect(url);
-        std::string request = "GET " + url.path;
-        request += " HTTP/1.1\r\n";
-        request += "Host: " + url.host;
-        if(url.customPort){
-            request += ":" + url.port;
-        }
-        request += "\r\n";
-        request += "Connection: Keep-Alive\r\n"; //TODO: czy tak ma być zawsze?
-        if(config.request_metadata){
-            request += "Icy-MetaData: 1\r\n";
-        }
-        if(!cookie.empty()) request += "Cookie: " + cookie + "\r\n";
-
-        request += "\r\n";
-        std::cerr << "wysyłam:\n" << request << "\n";
-        //ssl_write_all(ssl, request);
-        conn->writen(request);
-
-        //TODO: inna funkcja? czytanie po jednym znaku nie jest wydajne
-        std::string buffer = "";
-        //char chunk[4096]; //FIXME: STAŁE
-        size_t header_end_pos = std::string::npos;
-        std::cerr << "poczatek czytania nagłówków\n";
-        bool in_headers = true;
-        while (in_headers) {
-            char c;
-            ssize_t res = conn->read(&c, 1);
-            if(res < 0) throw std::runtime_error("Błąd podczas czytania nagłówków");
-            buffer += c;
-            //std::cerr << c << "\n";
-
-            if(buffer.length() >= 4 && buffer.substr(buffer.length() - 4) == "\r\n\r\n"){
-                in_headers = false;
-            }
-        }
-        std::cerr << "koniec czytania nagłówków\n";
-        std::string raw_headers = buffer;
-
-        std::cerr << "response:\n";
-        std::cerr << raw_headers << "\n";
-        HTTPResponse response = parseHttpResponse(raw_headers);
-
-        std::string temp_cookie = response.get_header("set-cookie");
-        if (!temp_cookie.empty()) cookie = temp_cookie.substr(0, temp_cookie.find(';'));
-        if(response.status_code == 200){
-            std::cerr << "OK\n";
-        }else if(response.status_code >= 300 && response.status_code < 400){
-            std::cerr << "redirect\n";
-            std::string loc = response.get_header("location");
-            current_url = loc;
-            if(current_url == ""){
-                throw std::runtime_error("Serwer wysłał redirect ale nie podał nowej lokalizacji");
-            }
-            continue;
-        }else{
-            //TODO: obsługa innych odpowiedzi
-            std::cerr << "Inny kod: " << response.status_code << "\n";
-            throw std::runtime_error("Serwer rzucił nieznany kod błędu");
-        }
+            auto conn = handleConnectionStart();
 
         // Skonfigurować poll
         // 1. socket -> audio z metadanymi
@@ -461,18 +487,7 @@ public:
         fds[1].revents = 0;
 
         char buf_c[8192]; //FIXME: STAŁE i lepiej vector
-        std::string meta_int_key = response.get_header("icy-metaint");
-        std::cerr << meta_int_key << "\n";
-        meta_int = 0;
-        if(meta_int_key != ""){
-            try {
-                meta_int = std::stoi(meta_int_key);
-            } catch (const std::exception& e){
-                std::cerr << "bład podczas czytania icy-metaint\n";
-            }
-        }else{
-            std::cerr << "brak metaint\n";
-        }
+        
         chars_to_meta = meta_int;
         state = State::AUDIO;
         meta_buffer.clear();
