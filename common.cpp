@@ -32,8 +32,8 @@ uint8_t read_timeout(const std::string& str) {
     return static_cast<uint8_t>(read_number(str, 100, 100000, "-t"));
 }
 
-uint32_t read_field(const std::string& str) {
-    return static_cast<uint32_t>(read_number(str, 0, std::numeric_limits<uint32_t>::max(), "message"));
+uint32_t read_verbosity(const std::string& str) {
+    return static_cast<uint32_t>(read_number(str, 0, 4, "-v"));
 }
 
 uint8_t to_uint8(uint32_t x) {

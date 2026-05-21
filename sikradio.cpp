@@ -140,6 +140,9 @@ SiteInfo parseUrl(std::string& url){
         result.scheme = temp.substr(0, colon_pos);
         temp = temp.substr(colon_pos + 1);
     }
+    if(result.scheme != "http" && result.scheme != "https"){
+        throw std::runtime_error("Unsupported protocol");
+    }
 
     if(temp.length() >= 2 && temp[0] == '/' && temp[1] == '/'){
         temp = temp.substr(2);
@@ -209,7 +212,7 @@ ClientConfig parse_arguments(int argc, char *argv[]){
                 ipv6_forced = true;
                 break;
             case 'v':
-                config.verbosity = read_field(optarg);
+                config.verbosity = read_verbosity(optarg);
                 break;
             case 'q':
                 config.verbosity = 0;
@@ -260,20 +263,23 @@ private:
     //TODO: osobny obiekt?
     void parseAudio(char *buf, ssize_t n){
         ssize_t i = 0;
-        while(i < n) {
-            if(meta_int == 0){
-                ssize_t to_write = n-i;
-                //write(STDOUT_FILENO, buf + i, to_write);
-                i += safe_stdout_write(buf+i, to_write);
-            } else {
-                if(state == State::AUDIO){
+        if(meta_int == 0){
+            safe_stdout_write(buf, n);
+            return;
+        }
+
+        while (i < n){
+            switch(state){
+                case State::AUDIO: {
                     size_t to_write = std::min((size_t)n - i, chars_to_meta);
-                    //write(STDOUT_FILENO, buf + i, to_write);
-                    ssize_t written = safe_stdout_write(buf + i, to_write);
+                    ssize_t written = safe_stdout_write(buf +i, to_write);
                     i += written;
                     chars_to_meta -= written;
-                    if(chars_to_meta == 0) state = State::META_LEN;
-                } else if(state == State::META_LEN){
+                    if (chars_to_meta == 0)
+                        state = State::META_LEN;
+                    break;
+                }
+                case State::META_LEN: {
                     unsigned char meta_len = buf[i++];
                     chars_to_meta = meta_len * 16;
                     if(chars_to_meta == 0){
@@ -283,18 +289,27 @@ private:
                         state = State::META_BODY;
                         meta_buffer.clear();
                     }
-                } else {
+                    break;
+                }
+                case State::META_BODY: {
                     size_t to_write = std::min((size_t)n - i, chars_to_meta);
                     meta_buffer.append(buf + i, to_write);
                     i += to_write;
                     chars_to_meta -= to_write;
                     if(chars_to_meta == 0){
-                        std::cerr << "metadata\n";
-                        std::cerr.write(meta_buffer.data(), meta_buffer.size());
-                        std::cerr.write("\n", 1);
+                        auto null_pos = meta_buffer.find('\0');
+                        if(null_pos != std::string::npos){
+                            meta_buffer = meta_buffer.substr(0, null_pos);
+                        }
+                        std::cerr << "metadata" << meta_buffer.length() << "l\n";
+                        //std::cerr.write(meta_buffer.data(), meta_buffer.length());
+                        if(!meta_buffer.empty()){
+                            std::cerr << meta_buffer << "\n";
+                        }
                         state = State::AUDIO;
                         chars_to_meta = meta_int;
                     }
+                    break;
                 }
             }
         }
@@ -488,8 +503,8 @@ public:
                     stdin_buffer.append(buf, n);
                     if(stdin_buffer.find("quit") != std::string::npos){
                         std::cerr << "Odczytano quit -> zakończono przez użytkownika\n";
-                        //return;
-                        exit(0);
+                        return;
+                        //exit(0);
                     }
                     if(stdin_buffer.length() > 1024) stdin_buffer.clear();
                 } else if(n == 0){
@@ -504,7 +519,8 @@ public:
                     size_t written;
                     ssize_t n  = conn->read(buf_c, sizeof(buf_c));
                     if(n == 0){
-                        exit(0);
+                        return;
+                        //exit(0);
                         // std::cerr << "serwer zamknal strumien\n";
                         // reconnect = true;
                         // break;
