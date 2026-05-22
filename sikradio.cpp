@@ -245,6 +245,7 @@ private:
     size_t chars_to_meta;
     size_t meta_int;
     State state = State::AUDIO;
+    bool end_program = false;
 
     ssize_t safe_stdout_write(char* buf, size_t n){
         ssize_t written = 0;
@@ -406,7 +407,7 @@ private:
             std::cerr << "wysyłam:\n" << request << "\n";
             conn->writen(request);
 
-            //TODO: czytanie po jednym znaku nie jest wydajne, brak wsparcia dla quit oraz obslugi timeoutu
+            //TODO: czytanie po jednym znaku nie jest wydajne, brak wsparcia dla quit oraz obslugi timeoutu oraz nie działa gdy dostajemy nieprawidłową odpowiedź!
             std::string buffer = "";
             //char chunk[4096]; //FIXME: STAŁE
             size_t header_end_pos = std::string::npos;
@@ -415,7 +416,16 @@ private:
             while (in_headers) {
                 char c;
                 ssize_t res = conn->read(&c, 1);
-                if(res < 0) throw std::runtime_error("Błąd podczas czytania nagłówków");
+                //if(res < 0) throw std::runtime_error("Błąd podczas czytania nagłówków");
+                if(res < 0){
+                    if(errno == EINTR || errno == EAGAIN) continue;
+                    throw std::system_error(errno, std::generic_category(), "header read");
+                } 
+                if(res == 0){
+                    std::cerr << "EOF\n";
+                    end_program = true;
+                    return nullptr;
+                }
                 buffer += c;
                 //std::cerr << c << "\n";
 
@@ -430,6 +440,7 @@ private:
             std::cerr << raw_headers << "\n";
             HTTPResponse response = parseHttpResponse(raw_headers);
 
+            //TODO: bardziej zaawansowana obsługa plików cookie!
             std::string temp_cookie = response.get_header("set-cookie");
             if (!temp_cookie.empty()) cookie = temp_cookie.substr(0, temp_cookie.find(';'));
             if(response.status_code == 200){
@@ -444,7 +455,7 @@ private:
                 redirect = true;
                 continue;
             }else{
-                //TODO: obsługa innych odpowiedzi
+                //TODO: obsługa innych odpowiedzi?
                 std::cerr << "Inny kod: " << response.status_code << "\n";
                 throw std::runtime_error("Serwer rzucił nieznany kod błędu");
             }
@@ -472,6 +483,7 @@ public:
         std::string cookie;
         while(true){
             auto conn = handleConnectionStart();
+            if(end_program) return;
 
         // Skonfigurować poll
         // 1. socket -> audio z metadanymi
@@ -493,11 +505,13 @@ public:
         meta_buffer.clear();
 
         bool reconnect = false;
+        end_program = false;
         while(!reconnect){
             int pending = conn->has_pending_data();
             int timeout = (pending > 0) ? 0 : config.timeout_ms;
             int p = poll(fds, 2, timeout);
 
+            //TODO: wejscie od uzytkownika nie moze resetowac timeoutu
             if(p < 0) {
                 if(errno == EINTR) continue;
                 throw std::runtime_error("Blad krytyczny poll()");
@@ -510,45 +524,68 @@ public:
             }
 
             // Wejście od użytkownika
-            if(fds[1].fd != -1 && fds[1].revents & (POLLIN | POLLERR)){
-                fds[1].revents = 0;
-                char buf[128];
-                ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
-                if(n > 0){
-                    stdin_buffer.append(buf, n);
-                    if(stdin_buffer.find("quit") != std::string::npos){
-                        std::cerr << "Odczytano quit -> zakończono przez użytkownika\n";
-                        return;
-                        //exit(0);
-                    }
-                    if(stdin_buffer.length() > 1024) stdin_buffer.clear();
-                } else if(n == 0){
-                    //zakończenie strumienia STDIN
+            if(fds[1].fd != -1 && fds[1].revents != 0){
+                if(fds[1].revents & (POLLERR | POLLNVAL)){
                     fds[1].fd = -1;
-                }//TODO: inne przypadki do error handlingu
+                }else if(fds[1].revents & (POLLIN | POLLHUP)) {
+                    char buf[128];
+                    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+                    if(n > 0){
+                        stdin_buffer.append(buf, n);
+                        if(stdin_buffer.find("quit") != std::string::npos){
+                            std::cerr << "Odczytano quit -> zakończono przez użytkownika\n";
+                            return;
+                            //exit(0);
+                        }
+                        if(stdin_buffer.length() > 1024) stdin_buffer.clear();
+                    } else if(n == 0){
+                        //zakończenie strumienia STDIN
+                        fds[1].fd = -1;
+                    } else {
+                        if(errno != EAGAIN && errno != EWOULDBLOCK) {
+                            fds[1].fd = -1; //TODO: napisac wytlumaczenie
+                        }
+                    }
+                }
+                fds[1].revents = 0;
             }
 
             // audio
-            if((fds[0].revents & (POLLIN | POLLERR)) || pending > 0){
-                fds[0].revents = 0;
+            if(fds[0].fd != -1 && (fds[0].revents != 0|| pending > 0)){
+                if(fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                    std::cerr << "blad gniazda\n";
+                    reconnect = true;
+                    break;
+                }
+
+                if((fds[0].revents & POLLIN) || pending > 0){
                     size_t written;
                     ssize_t n  = conn->read(buf_c, sizeof(buf_c));
                     if(n == 0){
+                        std::cerr << "Serwer zamknal strumien EOF\n";
+                        //end_program = true;
+                        //break;
                         return;
+                        //return;
                         //exit(0);
                         // std::cerr << "serwer zamknal strumien\n";
                         // reconnect = true;
                         // break;
                     } else if(n < 0){
-                        std::cerr << "blad strumienia";
-                        reconnect = true;
-                        break;
-                    } //TODO: inne przypadki do error handlingu
-                    std::cerr << "input z socketa: " << n << "\n";
-                    parseAudio(buf_c, n);
-                    std::cerr << "koniec inputu z socketa\n";
+                        if(errno == EINTR) continue;
+                        throw std::runtime_error("blad strumienia");
+                        //std::cerr << "blad strumienia";
+                        //reconnect = true;
+                        //break;
+                    }else{
+                        std::cerr << "input z socketa: " << n << "\n";
+                        parseAudio(buf_c, n);
+                        std::cerr << "koniec inputu z socketa\n";
+                    }
+                }    
             }
         }
+        if(end_program) return;
         }
     }
 
