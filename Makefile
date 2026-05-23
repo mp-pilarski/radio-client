@@ -10,12 +10,13 @@ TARGET = sikradio
 
 all: $(TARGET)
 
-$(TARGET): $(TARGET).o common.o connection.o
+$(TARGET): $(TARGET).o common.o connection.o cookie.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 connection.o: connection.cpp connection.h
 common.o: common.cpp common.h
-sikradio.o: sikradio.cpp common.h connection.h
+sikradio.o: sikradio.cpp common.h connection.h cookie.h
+cookie.o: cookie.cpp cookie.h common.h common.cpp
 
 clean:
 	rm -f $(TARGET) *.o *~
