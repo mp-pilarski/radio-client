@@ -1,219 +1,69 @@
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/tls1.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
-#include <iterator>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <openssl/buffer.h>
-#include <openssl/tls1.h>
-#include <stdexcept>
-#include <sys/types.h>
-#include <unistd.h>
-#include <string>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <iostream>
-#include <map>
-#include <sstream>
-#include <poll.h>
-#include <memory>
-#include <fcntl.h>
-#include <chrono>
 #include <format>
-
-#include <openssl/bio.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+#include <iostream>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <sstream>
+#include <stdexcept>
+#include <string>
 #include <vector>
-#include <algorithm>
 
 #include "common.h"
 #include "connection.h"
 #include "cookie.h"
 
-struct SiteInfo {
-    std::string scheme;
-    std::string host;
-    std::string port;
-    std::string path;
-    bool customPort = false;
-};
-
 struct ClientConfig {
     SiteInfo url;
     std::string url_string;
     bool request_metadata = false;
-    uint32_t timeout_ms = 5000; //MAYBE: zmienić na inny typ
-    int ip_version = AF_UNSPEC;
+    uint32_t timeout_ms = DEFAULT_TIMEOUT;
+    uint8_t ip_version = AF_UNSPEC;
     LoggingLevel verbosity = CRITICAL_ERROR;
 };
 
-enum State {
-    AUDIO,
-    META_LEN,
-    META_BODY
-};
+enum State { AUDIO, META_LEN, META_BODY };
 
 ClientConfig config;
 
-void log(LoggingLevel level, const std::string& msg){
-    if(config.verbosity >= level) std::cerr << msg << "\n";
+void log(LoggingLevel level, const std::string& msg) {
+    if (config.verbosity >= level) std::cerr << msg << "\n";
 }
 
-void print_current_time(){
-    auto now = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
+void print_current_time() {
+    auto now = std::chrono::floor<std::chrono::seconds>(
+        std::chrono::system_clock::now());
     auto local = std::chrono::zoned_time{std::chrono::current_zone(), now};
     log(COMMUNICATION, std::format("{:%Y.%m.%d %H.%M.%S}", local));
 }
 
-std::string prepareForGetAddr(std::string& s){
-    if(s[0] == '[' && s.back() == ']'){
-        return s.substr(1, s.length()-2);
-    }
-    return s;
-}
-
-HTTPResponse parseHttpResponse(const std::string& raw_input){
-    HTTPResponse response{};
-    std::istringstream stream(raw_input);
-    std::string line;
-
-    // Pierwsza linia to Wersja i status
-    if(std::getline(stream, line)){
-        trim(line);
-        size_t space1 = line.find(' ');
-        size_t space2 = line.find(' ', space1 + 1);
-
-        if (space1 != std::string::npos && space2 != std::string::npos) {
-            response.status_code = std::stoi(line.substr(space1 + 1, space2 - space1 - 1));
-            response.status_msg = line.substr(space2 + 1);
-        }
-    }
-
-    // Kolejne linie to wartości pól
-    while(std::getline(stream, line)){
-        //TODO: przyciac linie
-        trim(line);
-        if(line.empty()) continue;
-        size_t colon_pos = line.find(':');
-        if(colon_pos != std::string::npos){
-            std::string key = line.substr(0, colon_pos);
-            std::string val = line.substr(colon_pos + 1);
-            trim(key);
-            trim(val);
-            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c){ return std::tolower(c);});
-            response.headers.emplace(key, val);
-        }
-    }
-
-    return response;
-}
-
-//resolve_redirect(loc, url);
-std::string resolve_redirect(const std::string& location, const SiteInfo& url){
-    if(location.find("http://") == 0 || location.find("https://") == 0){
-        return location;
-    }
-
-    std::string new_loc = url.scheme + url.host;
-    if(url.customPort){
-        new_loc += ":" + url.port;
-    }
-    if(!location.empty() && location[0] == '/'){
-        new_loc += location;
-    }else{
-        // Sciezka wzgledna
-        std::string base_path = url.path;
-        auto slash = base_path.find_last_of('/');
-        if (slash != std::string::npos) {
-            new_loc += base_path.substr(0, slash + 1) + location;
-        } else {
-            new_loc += "/" + location;
-        }
-    }
-    return new_loc;
-}
-
-SiteInfo parseUrl(std::string& url){
-    SiteInfo result;
-    //TODO: usprawnić! + szerszy error handling!
-    //std::cerr << "url: " << url << "\n";
-    // Wycięcie fragmentu po # i zignorowanie go
-    std::string temp = url;
-    auto hash_pos = url.find('#');
-    if(hash_pos != std::string::npos) {
-        temp = temp.substr(0, hash_pos);
-    }
-
-    // MAYBE: czy odcinać queries od path?
-    // auto question_pos = temp.find('?');
-    // if(question_pos != std::string::npos){
-    //     //TODO: rozbić na queries?
-    //     temp = temp.substr(0, hash_pos);
-    // }
-
-    // Wyciągnięcie scheme
-    auto colon_pos = temp.find(':');
-    auto slash_pos = temp.find('/');
-
-    if(colon_pos != std::string::npos && (slash_pos == std::string::npos || colon_pos < slash_pos)){
-        result.scheme = temp.substr(0, colon_pos);
-        temp = temp.substr(colon_pos + 1);
-    }
-    if(result.scheme != "http" && result.scheme != "https"){
-        throw std::runtime_error("Unsupported protocol");
-    }
-
-    if(temp.length() >= 2 && temp[0] == '/' && temp[1] == '/'){
-        temp = temp.substr(2);
-
-        std::string authority;
-        slash_pos = temp.find('/');
-        if(slash_pos != std::string::npos) {
-            authority = temp.substr(0, slash_pos);
-            result.path = temp.substr(slash_pos);
-        }else{
-            authority = temp;
-            result.path = "/";
-        }
-
-        if(!authority.empty() && authority[0] == '['){
-            auto bracket_end = authority.find(']');
-            if(bracket_end != std::string::npos){
-                result.host = authority.substr(0, bracket_end+1);
-                authority = authority.substr(bracket_end+1);
-
-                if(!authority.empty() && authority[0] == ':'){
-                    result.port = authority.substr(1);
-                    result.customPort = true;
-                }
-
-            }
-        }else {
-            // Wyciągnięcie portu
-            auto port_colon = authority.find(':');
-            if(port_colon != std::string::npos) {
-                result.host = authority.substr(0, port_colon);
-                result.port = authority.substr(port_colon+1);
-                result.customPort = true;
-            }else{
-                result.host = authority;
-                result.port = (result.scheme == "https") ? "443" : "80";
-            }
-        }
-    }
-    return result;
-}
-
-ClientConfig parse_arguments(int argc, char *argv[]){
+ClientConfig parse_arguments(int argc, char* argv[]) {
     ClientConfig cfg{};
     std::string url;
     int opt;
     bool ipv4_forced = false, ipv6_forced = false;
-    while((opt = getopt(argc, argv, "u:mt:46v:q")) != -1){
+    while ((opt = getopt(argc, argv, "u:mt:46v:q")) != -1) {
         switch (opt) {
             case 'u':
                 url = optarg;
@@ -231,7 +81,8 @@ ClientConfig parse_arguments(int argc, char *argv[]){
                 ipv6_forced = true;
                 break;
             case 'v':
-                cfg.verbosity = static_cast<LoggingLevel>(read_verbosity(optarg));
+                cfg.verbosity =
+                    static_cast<LoggingLevel>(read_verbosity(optarg));
                 break;
             case 'q':
                 cfg.verbosity = SILENT;
@@ -240,91 +91,82 @@ ClientConfig parse_arguments(int argc, char *argv[]){
                 throw std::invalid_argument("Unknown parameter");
         }
     }
-    if(ipv4_forced && !ipv6_forced){
+    if (ipv4_forced && !ipv6_forced) {
         cfg.ip_version = AF_INET;
-    }else if(ipv6_forced && !ipv4_forced){
+    } else if (ipv6_forced && !ipv4_forced) {
         cfg.ip_version = AF_INET6;
-    }else{
+    } else {
         cfg.ip_version = AF_UNSPEC;
     }
 
-    if(url.empty()){
+    if (url.empty()) {
         throw std::invalid_argument("URL can't be empty");
     }
     cfg.url_string = url;
-    cfg.url = parseUrl(url); //TODO: czy potrzebne?
+    cfg.url = parse_url(url);
     return cfg;
 }
 
 class RadioClient {
-private:
+   private:
     ClientConfig config;
-    std::string stdin_buffer; //FIXME: ??
+    std::string stdin_buffer;
     std::string meta_buffer = "";
-    size_t chars_to_meta;
-    size_t meta_int;
+    size_t chars_to_meta;  // Ile znaków zostało do metadanych
+    size_t meta_int;       // Co ile znakow pojawiaja sie metadane
     bool metadata = false;
-    State state = State::AUDIO;
+    State state = State::AUDIO;  // Aktualny stan parsera audio
     bool end_program = false;
+    SSL_CTX *ssl_ctx; // Kontekst OpenSSL
+    bool ctx_init = false;
 
-    ssize_t safe_stdout_write(char* buf, size_t n){
-        ssize_t written = 0;
-        while(written < n) {
-            ssize_t res = write(STDOUT_FILENO, buf + written, n - written);
-            if(res < 0){
-                if(errno == EINTR) continue;
-                throw std::runtime_error("Blad zapisu do STDOUT");
-            }
-            written += res;
-        }
-        return written;
-    }
-
-    //TODO: argument zamienić na wektor
-    void parseAudio(char *buf, ssize_t n){
+    // Rozdziela metadane od audio
+    void parse_audio(char* buf, ssize_t n) {
         ssize_t i = 0;
-        if(!metadata){
+        // Nie ma metadanych -> można po prostu wypisać na stdout
+        if (!metadata) {
             safe_stdout_write(buf, n);
             return;
         }
 
-        while (i < n){
-            switch(state){
+        while (i < n) {
+            switch (state) {
+                // odbieranie AUDIO
                 case State::AUDIO: {
                     size_t to_write = std::min((size_t)n - i, chars_to_meta);
-                    ssize_t written = safe_stdout_write(buf +i, to_write);
+                    ssize_t written = safe_stdout_write(buf + i, to_write);
                     i += written;
                     chars_to_meta -= written;
-                    if (chars_to_meta == 0)
-                        state = State::META_LEN;
+                    if (chars_to_meta == 0) state = State::META_LEN;
                     break;
                 }
+                // bajt z długością metadanych
                 case State::META_LEN: {
-                    unsigned char meta_len = buf[i++];
-                    chars_to_meta = meta_len * 16;
-                    if(chars_to_meta == 0){
+                    uint8_t meta_len = buf[i++];
+                    chars_to_meta = meta_len * METADATA_MULT;
+                    if (chars_to_meta == 0) {
                         state = State::AUDIO;
                         chars_to_meta = meta_int;
-                    }else{
+                    } else {
                         state = State::META_BODY;
                         meta_buffer.clear();
                     }
                     break;
                 }
+                // metadane
                 case State::META_BODY: {
                     size_t to_write = std::min((size_t)n - i, chars_to_meta);
                     meta_buffer.append(buf + i, to_write);
                     i += to_write;
                     chars_to_meta -= to_write;
-                    if(chars_to_meta == 0){
-                        if(config.request_metadata){
+                    if (chars_to_meta == 0) {
+                        if (config.request_metadata) {
+                            // ucinanie \0 z końca metadanych
                             auto null_pos = meta_buffer.find('\0');
-                            if(null_pos != std::string::npos){
+                            if (null_pos != std::string::npos) {
                                 meta_buffer = meta_buffer.substr(0, null_pos);
                             }
-                            //std::cerr << "metadata" << meta_buffer.length() << "l\n";
-                            //std::cerr.write(meta_buffer.data(), meta_buffer.length());
-                            if(!meta_buffer.empty()){
+                            if (!meta_buffer.empty()) {
                                 std::cerr << meta_buffer << "\n";
                             }
                         }
@@ -337,360 +179,326 @@ private:
         }
     }
 
-    std::unique_ptr<Connection> serverConnect(SiteInfo url){
+    // Funkcja wykonująca niskopoziomową część łączenia się z serwerem
+    std::unique_ptr<Connection> server_connect(SiteInfo url) {
+        // Zgodnie z zaleceniami dokumentacji OpenSSL powinien być dokładnie jeden SSL_CTX na program
+        if(url.scheme == "https" && !ctx_init){
+            ssl_ctx = SSL_CTX_new(TLS_client_method());
+            if(!ssl_ctx) throw std::runtime_error("Failed to create SSL_CTX");
+        }
         addrinfo hints{}, *res, *rp;
         hints.ai_family = config.ip_version;
         hints.ai_socktype = SOCK_STREAM;
 
-        //FIXME: to jest brzydkie!
         print_current_time();
         log(COMMUNICATION, "resolving name " + url.host);
         int err = getaddrinfo(prepareForGetAddr(url.host).c_str(), url.port.c_str(), &hints, &res);
-        if(err != 0){
-            //std::cerr << "Bład nawiazania polaczenia: " << std::string(gai_strerror(err));
-            throw std::runtime_error("Błąd nawiązania połaczenia " + std::string(gai_strerror(err)));
+        if (err != 0) {
+            throw std::runtime_error("getaddrinfo error: " + std::string(gai_strerror(err)));
         }
         int fd = -1;
         char ipstr[INET6_ADDRSTRLEN];
         bool ipv6_brackets = false;
-        //TODO: czy to powinna być pętla?
-        for(rp = res; rp != nullptr; rp = rp->ai_next){
-            void *addr;
-            struct sockaddr_in *ipv4;
-            struct sockaddr_in6 *ipv6;
-            // get the pointer to the address itself,
-            // different fields in IPv4 and IPv6:
-            if (rp->ai_family== AF_INET) { // IPv4
-                ipv4= (struct sockaddr_in *)rp->ai_addr;
+        for (rp = res; rp != nullptr; rp = rp->ai_next) {
+            void* addr;
+            struct sockaddr_in* ipv4;
+            struct sockaddr_in6* ipv6;
+            if (rp->ai_family == AF_INET) {  // IPv4
+                ipv4 = (struct sockaddr_in*)rp->ai_addr;
                 addr = &(ipv4->sin_addr);
-            } else { // IPv6
-                ipv6= (struct sockaddr_in6 *)rp->ai_addr;
+            } else {  // IPv6
+                ipv6 = (struct sockaddr_in6*)rp->ai_addr;
                 addr = &(ipv6->sin6_addr);
                 ipv6_brackets = true;
             }
-            // convert the IP to a string and print it:
+            // Konwersja adresu IP na tekst
             inet_ntop(rp->ai_family, addr, ipstr, sizeof ipstr);
-            //printf(" %s: %s\n", ipver, ipstr);
 
             fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-            if(fd == -1) continue;
+            if (fd == -1) continue;
 
-            // TODO: gdzie to umiescic?
-            timeval tv;
-            tv.tv_sec = config.timeout_ms / 1000;
-            tv.tv_usec = (config.timeout_ms % 1000) * 1000;
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-            if(connect(fd, rp->ai_addr, rp->ai_addrlen) != -1){
+            if (connect(fd, rp->ai_addr, rp->ai_addrlen) != -1) {
                 break;
             }
             close(fd);
             fd = -1;
         }
-        //TODO: sytuacja w ktorej adres z ktorym udalo sie polaczyc ale nie ma udanego utworzenia Connection
+        // TODO: sytuacja w ktorej adres z ktorym udalo sie polaczyc ale nie ma
+        // udanego utworzenia Connection
         freeaddrinfo(res);
+
+        if (fd == -1) throw std::runtime_error("Could not connect to server");
+        
+        // Przygotowanie komunikatu dla użytkownika
         std::string msg = "connecting to server ";
-        if(ipv6_brackets){
+        if (ipv6_brackets) {
             msg.append("[");
             msg.append(ipstr);
             msg.append("]");
-        }else{
+        } else {
             msg.append(ipstr);
         }
         msg.append(":" + url.port);
         log(COMMUNICATION, msg);
-        //std::cerr << "połączono!\n";
-        if(fd == -1) throw std::runtime_error("brak serwera");
-        //fcntl(fd, F_SETFL, O_NONBLOCK);
-        // timeval tv { 0, config.timeout_ms };
-        return (url.scheme == "https") ?
-        std::unique_ptr<Connection>(new HttpsConnection(fd, url.host.c_str())) :
-        std::unique_ptr<Connection>(new HttpConnection(fd));
+
+        timeval tv;
+        tv.tv_sec = config.timeout_ms / 1000;
+        tv.tv_usec = (config.timeout_ms % 1000) * 1000;
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+            throw std::system_error(errno, std::generic_category(), "setsockopt");
+        }
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+            throw std::system_error(errno, std::generic_category(), "setsockopt");
+        }
+
+        if (url.scheme == "https") {
+            return std::make_unique<HttpsConnection>(fd, url.host.c_str(), ssl_ctx);
+        } else {
+            return std::make_unique<HttpConnection>(fd);
+        }
     }
 
-    //jakaś lepsza nazwa?
-    std::unique_ptr<Connection> handleConnectionStart(){
+    // Funkcja wykonujące wysokopoziomową część łączenia się z serwerem;
+    std::unique_ptr<Connection> connection_start() {
         std::string current_url = config.url_string;
-        std::string cookie;
         bool redirect = true;
         std::unique_ptr<Connection> conn = nullptr;
         CookieManager cookie_mgmt = {};
-        while(redirect){
+        
+        while (redirect) {
             redirect = false;
-            SiteInfo url = parseUrl(current_url);
-            conn = serverConnect(url);
+            SiteInfo url = parse_url(current_url);
+            conn = server_connect(url);
 
             // Przygotowanie requestu
             std::string request = "GET " + url.path;
             request += " HTTP/1.1\r\n";
-            request += "Host: " + url.host;
-            //Port ma nie byc uwzgledniany w requescie
-            /*if(url.customPort){
-                request += ":" + url.port;
-            }*/
-            request += "\r\n";
+            request += "Host: " + url.host + "\r\n";
+            // Port ma nie byc uwzgledniany w nagłowku Host
             request += "Connection: Keep-Alive\r\n";
-            if(config.request_metadata){
+            if (config.request_metadata) {
                 request += "Icy-MetaData: 1\r\n";
             }
-            std::string cookies = cookie_mgmt.get_cookie_header(url.host, url.path, url.scheme == "https");
-            if(!cookies.empty()){
+            // Dodanie zapisanych cookies do requestu
+            std::string cookies = cookie_mgmt.get_cookie_header(
+                url.host, url.path, url.scheme == "https");
+            if (!cookies.empty()) {
                 request += "Cookie: ";
-                request += cookies;  
+                request += cookies;
                 request += "\r\n";
             }
-            //if(!cookie.empty()) request += "Cookie: " + cookie + "\r\n";
             request += "\r\n";
 
-            //std::cerr << "wysyłam:\n" << request << "\n";
-            log(LoggingLevel::COMMUNICATION, request); //TODO: jaki level COMMUNICATION CZY DIAGNOSTIC
+            log(LoggingLevel::COMMUNICATION, request);
             conn->writen(request);
 
-            //TODO: czytanie po jednym znaku nie jest wydajne, brak wsparcia dla quit oraz obslugi timeoutu oraz nie działa gdy dostajemy nieprawidłową odpowiedź!
+            // Odbiór nagłówków od serwera:
             std::string buffer = "";
-            //char chunk[4096]; //FIXME: STAŁE
-            size_t header_end_pos = std::string::npos;
-            //std::cerr << "poczatek czytania nagłówków\n";
             bool in_headers = true;
             bool checked_start = false;
             while (in_headers) {
                 char c;
                 ssize_t res = conn->read(&c, 1);
-                //if(res < 0) throw std::runtime_error("Błąd podczas czytania nagłówków");
-                if(res < 0){
-                    if(errno == EINTR || errno == EAGAIN) continue;
-                    throw std::system_error(errno, std::generic_category(), "header read");
-                } 
-                if(res == 0){
-                    //std::cerr << "EOF\n";
+                if (res < 0) {
+                    if (errno == EINTR || errno == EAGAIN) continue;
+                    throw std::system_error(
+                        errno, std::generic_category(),
+                        "header read");  // TODO: troche inaczej bo TLS nie
+                                         // rzuca errno
+                }
+                if (res == 0) {
                     end_program = true;
                     return nullptr;
                 }
                 buffer += c;
-                //std::cerr << c << "\n";
 
-                if(!checked_start && buffer.length() >= 4){
+                //
+                if (!checked_start && buffer.length() >= 4) {
                     checked_start = true;
-                    if(!(buffer.substr(0, 4) == "HTTP" || buffer.substr(0,3) == "ICY")){
-                        throw std::runtime_error("Server did not sent proper response");
+                    if (!(buffer.substr(0, 4) == "HTTP" ||
+                          buffer.substr(0, 3) == "ICY")) {
+                        throw std::runtime_error(
+                            "Server did not send proper response");
                     }
                 }
 
-                // koniec naglowkow
-                if(buffer.length() >= 4 && buffer.substr(buffer.length() - 4) == "\r\n\r\n"){
+                // Nagłówki kończą się jeśli wystąpił podwójny koniec
+                if (buffer.length() >= 4 &&
+                    buffer.substr(buffer.length() - 4) == "\r\n\r\n") {
                     in_headers = false;
                 }
             }
-            //std::cerr << "koniec czytania nagłówków\n";
-            std::string raw_headers = buffer;
 
-            //std::cerr << "response:\n";
-            //std::cerr << raw_headers << "\n";
-            log(LoggingLevel::COMMUNICATION, raw_headers); //TODO: jaki level COMMUNICATION CZY DIAGNOSTIC
-            HTTPResponse response = parseHttpResponse(raw_headers);
+            log(LoggingLevel::COMMUNICATION, buffer);
+            HTTPResponse response = parse_http_response(buffer);
 
-            //TODO: bardziej zaawansowana obsługa plików cookie!
             cookie_mgmt.update_from_response(response, url.host);
-            if(response.status_code == 200){
-                //std::cerr << "OK\n";
-            }else if(response.status_code >= 300 && response.status_code < 400){
-                //std::cerr << "redirect\n";
-                //TODO: relative location support
-                std::string loc = response.get_header("location").front(); //TODO: słabe rozwiazanie z front()
-                // Serwer podał odpowiedz wzgledna 
-                if(loc == ""){
-                    throw std::runtime_error("Serwer wysłał redirect ale nie podał nowej lokalizacji");
+            if (response.status_code == 200) {
+                log(DIAGNOSTIC, "OK STATUS CODE");
+            } else if (response.status_code >= 300 && response.status_code < 400) {
+                std::string loc =
+                    response.get_header("location").front();
+                if (loc == "") {
+                    throw std::runtime_error(
+                        "Server sent redirect response without Location "
+                        "header");
                 }
                 current_url = resolve_redirect(loc, url);
-                if(loc.length() >= 1 && loc[0] == '/'){
-                    current_url = url.scheme + "://" + url.host;
-                    if(url.customPort){
-                        current_url += ":" + url.port;
-                    }
-                    current_url += loc;
-                }else{
-                    current_url = loc;
-                }
                 redirect = true;
                 continue;
-            }else{
-                //TODO: obsługa innych odpowiedzi?
-                //std::cerr << "Inny kod: " << response.status_code << "\n";
-                throw std::runtime_error("Serwer rzucił nieznany kod błędu");
+            } else {
+                throw std::runtime_error("Serwer send unknown response code: " +
+                                         std::to_string(response.status_code));
             }
-            std::string meta_int_key = response.get_header("icy-metaint").front(); //TODO: slabe rozwiazanie z front
-            //std::cerr << meta_int_key << "\n";
+
+            // Zapisanie odstępu między metadanymi
+            std::string meta_int_key = response.get_header("icy-metaint").front();
             meta_int = 0;
-            if(meta_int_key != ""){
+            if (meta_int_key != "") {
                 try {
                     meta_int = std::stoi(meta_int_key);
                     metadata = true;
-                } catch (const std::exception& e){
-                    log(DIAGNOSTIC, "Error during reading icy-metaint");
+                } catch (const std::exception& e) {
+                    log(DIAGNOSTIC, "Error during reading icy-metaint - assuming no metadata");
                     metadata = false;
-                    //std::cerr << "bład podczas czytania icy-metaint\n";
                 }
-            }else{
+            } else {
                 log(DIAGNOSTIC, "No metaint");
-                //std::cerr << "brak metaint\n";
             }
         }
         return conn;
     }
 
-public:
+   public:
     RadioClient(const ClientConfig& cfg) : config(cfg) {}
 
-    void run(){
-        std::string current_url = config.url_string;
-        std::string cookie;
-        while(true){
-            auto conn = handleConnectionStart();
-            if(end_program) return;
+    ~RadioClient() {
+        // Podczas niszczenia obiektu należy zniszczyć kontekst.
+        if (ssl_ctx) SSL_CTX_free(ssl_ctx);
+    }
 
-        // Skonfigurować poll
-        // 1. socket -> audio z metadanymi
-        // 2. stdin -> przerwanie od użytkownika
-        //TODO: zastosować stałe zamiast indeksów oraz wydzielić część kodu do osobnej funkcji
-        pollfd fds[2];
-        fds[0].fd = conn->get_fd();
-        fds[0].events = POLLIN;
-        fds[0].revents = 0;
+    void run() {
+        while (true) {
+            auto conn = connection_start();
+            if (end_program) return;
 
-        fds[1].fd = STDIN_FILENO;
-        fds[1].events = POLLIN;
-        fds[1].revents = 0;
+            pollfd fds[2];
+            fds[SERVER_FD].fd = conn->get_fd();
+            fds[SERVER_FD].events = POLLIN;
+            fds[SERVER_FD].revents = 0;
 
-        char buf_c[8192]; //FIXME: STAŁE i lepiej vector
-        
-        chars_to_meta = meta_int;
-        state = State::AUDIO;
-        meta_buffer.clear();
+            fds[STDIN_FD].fd = STDIN_FILENO;
+            fds[STDIN_FD].events = POLLIN;
+            fds[STDIN_FD].revents = 0;
 
-        bool reconnect = false;
-        end_program = false;
-        auto last_network_activity = std::chrono::steady_clock::now();
-        //std::cerr << "config.timeout_ms = " << config.timeout_ms << "\n";
-        while(!reconnect){
-            //std::cerr << "config.timeout_ms = " << config.timeout_ms << "\n";
-            int pending = conn->has_pending_data();
-            //int timeout = (pending > 0) ? 0 : config.timeout_ms;
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_network_activity).count();
-            // 3. Obliczamy ile czasu (w milisekundach) pozostało do rzucenia timeoutu
-            int remaining_timeout = config.timeout_ms - elapsed_ms;
+            char buf_c[8192];  // FIXME: STAŁE i lepiej vector
 
-            // 4. Jeśli czas minął (a OpenSSL nie ma ukrytych w buforze danych), rozłączamy
-            if (remaining_timeout <= 0 && pending == 0) {
-                //std::cerr << "Timeout - brak danych od " << config.timeout_ms << " ms. Wznawianie...\n";
-                log(COMMUNICATION, "data receiving timeout");
-                reconnect = true;
-                break;
-            }
-            int timeout = (pending > 0) ? 0 : remaining_timeout;
-            int p = poll(fds, 2, timeout);
+            chars_to_meta = meta_int;
+            state = State::AUDIO;
+            meta_buffer.clear(); //TODO: przy pozniejszych zmianach bedzie do usuniecia
 
+            bool reconnect = false;
+            end_program = false;
+            auto last_network_activity = std::chrono::steady_clock::now();
+            while (!reconnect) {
+                bool pending = conn->has_pending_data();
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(now - last_network_activity).count();
+                auto remaining_timeout = config.timeout_ms - elapsed_ms;
 
-
-            //TODO: wejscie od uzytkownika nie moze resetowac timeoutu
-            if(p < 0) {
-                if(errno == EINTR) continue;
-                throw std::runtime_error("Blad krytyczny poll()"); //TODO: errno!
-            }
-
-            now = std::chrono::steady_clock::now();
-            elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_network_activity).count();
-            remaining_timeout = config.timeout_ms - elapsed_ms;
-            if(p == 0 && pending == 0 && remaining_timeout < 0){
-                //std::cerr << "poll timeout\n";
-                log(COMMUNICATION, "data receiving timeout");
-                reconnect = true;
-                break;
-            }
-
-            // Wejście od użytkownika
-            if(fds[1].fd != -1 && fds[1].revents != 0){
-                if(fds[1].revents & (POLLERR | POLLNVAL)){
-                    fds[1].fd = -1;
-                }else if(fds[1].revents & (POLLIN | POLLHUP)) {
-                    char buf[128];
-                    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
-                    if(n > 0){
-                        stdin_buffer.append(buf, n);
-                        if(stdin_buffer.find("quit\n") != std::string::npos){
-                            //std::cerr << "Odczytano quit -> zakończono przez użytkownika\n";
-                            log(DIAGNOSTIC, "Got quit -> program terminated by user");
-                            return;
-                            //exit(0);
-                        }
-                        if(stdin_buffer.length() > 1024) stdin_buffer.clear();
-                    } else if(n == 0){
-                        //zakończenie strumienia STDIN
-                        fds[1].fd = -1;
-                    } else {
-                        if(errno != EAGAIN && errno != EWOULDBLOCK) {
-                            fds[1].fd = -1; //TODO: napisac wytlumaczenie
-                        }
-                    }
-                }
-                fds[1].revents = 0;
-            }
-
-            // audio
-            if(fds[0].fd != -1 && (fds[0].revents != 0 || pending > 0)){
-                if(fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                    //std::cerr << "blad gniazda\n";
-                    log(NONCRITICAL_ERROR, "Server socket error");
+                // Czas minął oraz OpenSSL nie ma zbuforowanych danych
+                if (remaining_timeout <= 0 && pending == 0) {
+                    log(COMMUNICATION, "data receiving timeout");
                     reconnect = true;
                     break;
                 }
 
-                if((fds[0].revents & POLLIN) || pending > 0){
-                    size_t written;
-                    ssize_t n  = conn->read(buf_c, sizeof(buf_c));
-                    if(n == 0){
-                        log(CRITICAL_ERROR, "Server closed connection");
-                        //std::cerr << "Serwer zamknal strumien EOF\n";
-                        //end_program = true;
-                        //break;
-                        return;
-                        //return;
-                        //exit(0);
-                        // std::cerr << "serwer zamknal strumien\n";
-                        // reconnect = true;
-                        // break;
-                    } else if(n < 0){
-                        if(errno == EINTR) continue;
-                        throw std::runtime_error("blad strumienia"); //todo: errno
-                        //std::cerr << "blad strumienia";
-                        //reconnect = true;
-                        //break;
-                    }else{
-                        //std::cerr << "input z socketa: " << n << "\n";
-                        parseAudio(buf_c, n);
-                        //std::cerr << "koniec inputu z socketa\n";
-                        last_network_activity = std::chrono::steady_clock::now();
-                        //std::cerr << "odswiezenie last_network_activity\n";
-                    }
+                int timeout = pending ? 0 : static_cast<int>(remaining_timeout);
+                int p = poll(fds, 2, timeout);
+
+                if (p < 0) {
+                    if (errno == EINTR) continue;
+                    throw std::system_error(errno, std::generic_category(),
+                                            "poll");
                 }
-                fds[0].revents = 0;
+
+                now = std::chrono::steady_clock::now();
+                elapsed_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(now - last_network_activity).count();
+                remaining_timeout = config.timeout_ms - elapsed_ms;
+                // poll przekroczyl limit czasu
+                if (p == 0 && pending == 0 && remaining_timeout < 0) {
+                    log(COMMUNICATION, "data receiving timeout");
+                    reconnect = true;
+                    break;
+                }
+
+                // Wejście od użytkownika
+                if (fds[1].fd != -1 && fds[1].revents != 0) {
+                    if (fds[1].revents & (POLLERR | POLLNVAL)) {
+                        fds[1].fd = -1;
+                    } else if (fds[1].revents & (POLLIN | POLLHUP)) {
+                        char buf[128]; //TODO: !!!
+                        ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+                        if (n > 0) {
+                            stdin_buffer.append(buf, n);
+                            if (stdin_buffer.find("quit\n") !=
+                                std::string::npos) {
+                                log(DIAGNOSTIC, "quit on stdin - program terminated by user");
+                                return;
+                            }
+                            if (stdin_buffer.length() > 128)
+                                stdin_buffer.clear();
+                        } else if (n == 0) {
+                            // zakończenie strumienia STDIN
+                            log(DIAGNOSTIC, "stdin closed - EOF");
+                            fds[1].fd = -1;
+                        } else {
+                            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                                log(NONCRITICAL_ERROR, std::string("stdin error: ") + strerror(errno));
+                                fds[1].fd = -1;  // Błąd STDIN, kontynuujemy streaming
+                            }
+                        }
+                    }
+                    fds[1].revents = 0;
+                }
+
+                // audio
+                if (fds[SERVER_FD].fd != -1 && (fds[SERVER_FD].revents != 0 || pending > 0)) {
+                    if (fds[SERVER_FD].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                        log(NONCRITICAL_ERROR, "Server socket error");
+                        reconnect = true;
+                        break;
+                    }
+
+                    if ((fds[SERVER_FD].revents & POLLIN) || pending > 0) {
+                        ssize_t n = conn->read(buf_c, sizeof(buf_c));
+                        if (n == 0) {
+                            log(CRITICAL_ERROR, "Server closed connection");
+                            return;
+                        } else if (n < 0) {
+                            if (errno == EINTR) continue;
+                            throw std::runtime_error("blad strumienia");  // TODO: errno?
+                        } else {
+                            parse_audio(buf_c, n);
+                            last_network_activity = std::chrono::steady_clock::now();
+                        }
+                    }
+                    fds[SERVER_FD].revents = 0;
+                }
             }
         }
-        if(end_program) return;
-        }
     }
-
 };
 
-int main(int argc, char *argv[]){
-    try{
+int main(int argc, char* argv[]) {
+    try {
         config = parse_arguments(argc, argv);
         RadioClient client(config);
         client.run();
-    } catch(const std::exception &e){
+    } catch (const std::exception& e) {
         log(CRITICAL_ERROR, e.what());
-        //std::cerr << e.what() << "\n";
         return 1;
     }
     return 0;
