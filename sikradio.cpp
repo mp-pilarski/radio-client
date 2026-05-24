@@ -263,6 +263,7 @@ private:
     std::string meta_buffer = "";
     size_t chars_to_meta;
     size_t meta_int;
+    bool metadata = false;
     State state = State::AUDIO;
     bool end_program = false;
 
@@ -282,7 +283,7 @@ private:
     //TODO: argument zamienić na wektor
     void parseAudio(char *buf, ssize_t n){
         ssize_t i = 0;
-        if(meta_int == 0){
+        if(!metadata){
             safe_stdout_write(buf, n);
             return;
         }
@@ -342,7 +343,6 @@ private:
         hints.ai_socktype = SOCK_STREAM;
 
         //FIXME: to jest brzydkie!
-        //std::cerr << prepareForGetAddr(url.host) << "\n";
         print_current_time();
         log(COMMUNICATION, "resolving name " + url.host);
         int err = getaddrinfo(prepareForGetAddr(url.host).c_str(), url.port.c_str(), &hints, &res);
@@ -453,6 +453,7 @@ private:
             size_t header_end_pos = std::string::npos;
             //std::cerr << "poczatek czytania nagłówków\n";
             bool in_headers = true;
+            bool checked_start = false;
             while (in_headers) {
                 char c;
                 ssize_t res = conn->read(&c, 1);
@@ -469,6 +470,14 @@ private:
                 buffer += c;
                 //std::cerr << c << "\n";
 
+                if(!checked_start && buffer.length() >= 4){
+                    checked_start = true;
+                    if(!(buffer.substr(0, 4) == "HTTP" || buffer.substr(0,3) == "ICY")){
+                        throw std::runtime_error("Server did not sent proper response");
+                    }
+                }
+
+                // koniec naglowkow
                 if(buffer.length() >= 4 && buffer.substr(buffer.length() - 4) == "\r\n\r\n"){
                     in_headers = false;
                 }
@@ -516,8 +525,10 @@ private:
             if(meta_int_key != ""){
                 try {
                     meta_int = std::stoi(meta_int_key);
+                    metadata = true;
                 } catch (const std::exception& e){
                     log(DIAGNOSTIC, "Error during reading icy-metaint");
+                    metadata = false;
                     //std::cerr << "bład podczas czytania icy-metaint\n";
                 }
             }else{
