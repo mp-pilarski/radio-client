@@ -77,7 +77,7 @@ Type `quit` followed by Enter on standard input to stop cleanly. The client also
 - `1` — invalid arguments or a critical error that prevents continuing.
 
 ## Example radio stations
-http://stream3.polskieradio.pl:8900
-http://an04.cdn.eurozet.pl/ant-web.mp3
-https://stream.nowyswiat.online/mp3
-https://rs101-krk.rmfstream.pl/rmf_fm
+- http://stream3.polskieradio.pl:8900
+- http://an04.cdn.eurozet.pl/ant-web.mp3
+- https://stream.nowyswiat.online/mp3
+- https://rs101-krk.rmfstream.pl/rmf_fm
