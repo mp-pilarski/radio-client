@@ -1,5 +1,3 @@
-#include "connection.h"
-
 #include <openssl/bio.h>
 #include <openssl/crypto.h>
 #include <openssl/err.h>
@@ -7,12 +5,12 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-
 #include <cerrno>
 #include <cstddef>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include "connection.h"
 
 HttpConnection::~HttpConnection() {
     if (fd >= 0) close(fd);
@@ -26,56 +24,42 @@ ssize_t HttpConnection::read(char* buffer, size_t n) {
     return res;
 }
 
-bool HttpConnection::writen(const std::string& data) {
+ssize_t HttpConnection::writen(const std::string& data) {
     size_t total_sent = 0;
     size_t len = data.length();
     const char* buf = data.c_str();
 
     while (total_sent < len) {
-        ssize_t sent;
-        sent = send(fd, buf + total_sent, len - total_sent, 0);
+        ssize_t sent = send(fd, buf + total_sent, len - total_sent, 0);
 
         if (sent <= 0) {
             if (errno == EINTR) continue;
-            return false;
+            return sent;
         }
         total_sent += sent;
     }
-    return true;
+    return static_cast<ssize_t>(total_sent);
 }
 
 int HttpConnection::get_fd() const { return fd; }
 
 bool HttpConnection::has_pending_data() { return false; }
 
+
+// Funkcję opracowano na podstawie przykładów z dokumentacji biblioteki OpenSSL
 HttpsConnection::HttpsConnection(int socket_fd, const char* host, SSL_CTX *context)
     : fd(socket_fd), ctx(context) {
-
-    // odrzucenie połączenia jeśli weryfikacja certyfikatu kończy się
-    // niepowodzeniem
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
-    //  użycie domyślnego zestawu zaufanych certyfikatów
-    if (!SSL_CTX_set_default_verify_paths(ctx)) {
-        SSL_CTX_free(ctx);
-        throw std::runtime_error(
-            "Failed to set the default trusted certificate store\n");
-    }
-    // MAYBE: ustawienie minimalnej wersji protokołu
     ssl = SSL_new(ctx);
     if (!ssl) {
         close(fd);
-        SSL_CTX_free(ctx);
-        throw std::runtime_error(
-            "Failed to create the SSL object\n");
+        throw std::runtime_error("Failed to create the SSL object\n");
     }
 
-    // połączenie ssl z fd
     SSL_set_fd(ssl, fd);
 
     if (!SSL_set_tlsext_host_name(ssl, host)) {
         close(fd);
         SSL_free(ssl);
-        SSL_CTX_free(ctx);
         throw std::runtime_error(
             "Failed to set the certificate verification hostname\n");
     }
@@ -92,7 +76,6 @@ HttpsConnection::HttpsConnection(int socket_fd, const char* host, SSL_CTX *conte
         }
         close(fd);
         SSL_free(ssl);
-        SSL_CTX_free(ctx);
         throw std::runtime_error(err_msg);
     }
 }
@@ -106,17 +89,6 @@ HttpsConnection::~HttpsConnection() {
     if (fd >= 0) close(fd);
 }
 
-// ssize_t HttpsConnection::read(char* buffer, size_t n) {
-//     size_t res;
-//     if (SSL_read_ex(ssl, buffer, n, &res) <= 0) {
-//         int err = SSL_get_error(ssl, 0);
-//         // Opcjonalnie: obsługa SSL_ERROR_WANT_READ jeśli używasz non-blocking IO
-//         if (err == SSL_ERROR_ZERO_RETURN) return 0; // Łagodne zamknięcie połączenia
-//         return -1; // Błąd wejścia/wyjścia
-//     }
-//     return static_cast<ssize_t>(res);
-// }
-
 ssize_t HttpsConnection::read(char* buffer, size_t n){
     size_t bytes_read;
     int ret = SSL_read_ex(ssl, buffer, n, &bytes_read);
@@ -125,7 +97,7 @@ ssize_t HttpsConnection::read(char* buffer, size_t n){
         if (err == SSL_ERROR_ZERO_RETURN) return 0; // Serwer zamknal polaczenie
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
             // OpenSSL potrzebuje więcej danych, nie jest to błąd krytyczny
-            errno = EAGAIN;
+            errno = EAGAIN; //errno jest ustawiane, żeby error handling w innych miejscach był spójny ze zwykłymi socketami
             return -1;
         }
         return -1; // Inny krytyczny blad
@@ -133,7 +105,7 @@ ssize_t HttpsConnection::read(char* buffer, size_t n){
     return static_cast<ssize_t>(bytes_read);
 }
 
-bool HttpsConnection::writen(const std::string& data) {
+ssize_t HttpsConnection::writen(const std::string& data) {
     size_t total = 0;
     size_t len = data.length();
     const char* buf = data.c_str();
@@ -146,11 +118,11 @@ bool HttpsConnection::writen(const std::string& data) {
             if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
                 continue;
             }
-            return false;
+            return ret;
         }
         total += n_written;
     }
-    return true;
+    return static_cast<ssize_t>(total);
 }
 
 int HttpsConnection::get_fd() const { return fd; }

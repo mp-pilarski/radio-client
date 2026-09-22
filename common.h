@@ -16,6 +16,8 @@ constexpr uint16_t METADATA_MULT = 16;
 constexpr size_t SERVER_FD = 0;
 constexpr size_t STDIN_FD = 1;
 constexpr uint32_t DEFAULT_TIMEOUT = 5000;
+constexpr size_t SMALL_BUF = 1024; // 1kB
+constexpr size_t BIG_BUF = 32*1024; // 16kB
 
 
 // Funckje pomocnicze, do czytania z wejścia:
@@ -28,5 +30,5 @@ void trim(std::string& s);
 void printCurrentTime();
 std::string prepareForGetAddr(std::string& s);
 void stringToLower(std::string& s);
-size_t safe_stdout_write(char* buf, size_t n);
+size_t safe_stdout_write(const char* buf, size_t n);
 #endif

@@ -51,4 +51,4 @@ public:
 
 HTTPResponse parse_http_response(const std::string& raw_input);
 std::string resolve_redirect(const std::string& location, const SiteInfo& url);
-SiteInfo parse_url(std::string& url);
+SiteInfo parse_url(const std::string& url);

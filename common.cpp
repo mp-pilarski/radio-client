@@ -62,7 +62,6 @@ std::vector<std::string> split(const std::string& s, char delimiter) {
     std::string token;
     std::istringstream tokenStream(s);
     while (std::getline(tokenStream, token, delimiter)) {
-        // tokens.push_back(trim(token));
         trim(token);
         tokens.push_back(token);
     }
@@ -86,7 +85,7 @@ void stringToLower(std::string& s) {
                    [](unsigned char c) { return std::tolower(c); });
 }
 
-size_t safe_stdout_write(char* buf, size_t n) {
+size_t safe_stdout_write(const char* buf, size_t n) {
     size_t written = 0;
     while (written < n) {
         ssize_t res = write(STDOUT_FILENO, buf + written, n - written);

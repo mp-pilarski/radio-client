@@ -1,5 +1,4 @@
 #include <arpa/inet.h>
-#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <openssl/bio.h>
@@ -11,8 +10,6 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-
-#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -22,13 +19,12 @@
 #include <exception>
 #include <format>
 #include <iostream>
-#include <iterator>
-#include <map>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <signal.h>
 
 #include "common.h"
 #include "connection.h"
@@ -112,16 +108,17 @@ class RadioClient {
     ClientConfig config;
     std::string stdin_buffer;
     std::string meta_buffer = "";
+    std::vector<char> buffer;
     size_t chars_to_meta;  // Ile znaków zostało do metadanych
     size_t meta_int;       // Co ile znakow pojawiaja sie metadane
     bool metadata = false;
     State state = State::AUDIO;  // Aktualny stan parsera audio
     bool end_program = false;
-    SSL_CTX *ssl_ctx; // Kontekst OpenSSL
+    SSL_CTX *ssl_ctx = nullptr; // Kontekst OpenSSL
     bool ctx_init = false;
 
     // Rozdziela metadane od audio
-    void parse_audio(char* buf, ssize_t n) {
+    void parse_audio(const char* buf, ssize_t n) {
         ssize_t i = 0;
         // Nie ma metadanych -> można po prostu wypisać na stdout
         if (!metadata) {
@@ -180,12 +177,20 @@ class RadioClient {
     }
 
     // Funkcja wykonująca niskopoziomową część łączenia się z serwerem
-    std::unique_ptr<Connection> server_connect(SiteInfo url) {
+    std::unique_ptr<Connection> server_connect(SiteInfo& url) {
         // Zgodnie z zaleceniami dokumentacji OpenSSL powinien być dokładnie jeden SSL_CTX na program
         if(url.scheme == "https" && !ctx_init){
+            ctx_init = true;
             ssl_ctx = SSL_CTX_new(TLS_client_method());
             if(!ssl_ctx) throw std::runtime_error("Failed to create SSL_CTX");
+            // Odrzucenie połączenia jeśli weryfikacja certyfikatu kończy się niepowodzeniem
+            SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
+            // Użycie domyślnego zestawu zaufanych certyfikatów
+            if (!SSL_CTX_set_default_verify_paths(ssl_ctx)) {
+                throw std::runtime_error("Failed to set the default trusted certificate store\n");
+            }
         }
+        signal(SIGPIPE, SIG_IGN);
         addrinfo hints{}, *res, *rp;
         hints.ai_family = config.ip_version;
         hints.ai_socktype = SOCK_STREAM;
@@ -203,6 +208,7 @@ class RadioClient {
             void* addr;
             struct sockaddr_in* ipv4;
             struct sockaddr_in6* ipv6;
+            ipv6_brackets = false;
             if (rp->ai_family == AF_INET) {  // IPv4
                 ipv4 = (struct sockaddr_in*)rp->ai_addr;
                 addr = &(ipv4->sin_addr);
@@ -223,8 +229,6 @@ class RadioClient {
             close(fd);
             fd = -1;
         }
-        // TODO: sytuacja w ktorej adres z ktorym udalo sie polaczyc ale nie ma
-        // udanego utworzenia Connection
         freeaddrinfo(res);
 
         if (fd == -1) throw std::runtime_error("Could not connect to server");
@@ -245,12 +249,14 @@ class RadioClient {
         tv.tv_sec = config.timeout_ms / 1000;
         tv.tv_usec = (config.timeout_ms % 1000) * 1000;
         if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+            close(fd);
             throw std::system_error(errno, std::generic_category(), "setsockopt");
         }
         if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+            close(fd);
             throw std::system_error(errno, std::generic_category(), "setsockopt");
         }
-
+        // Wlascicielem fd jest obiekt Connection
         if (url.scheme == "https") {
             return std::make_unique<HttpsConnection>(fd, url.host.c_str(), ssl_ctx);
         } else {
@@ -290,47 +296,59 @@ class RadioClient {
             request += "\r\n";
 
             log(LoggingLevel::COMMUNICATION, request);
-            conn->writen(request);
+            
+            if(conn->writen(request) < static_cast<ssize_t>(request.length())){
+                throw std::runtime_error("Failed write");
+            }
 
             // Odbiór nagłówków od serwera:
-            std::string buffer = "";
+            // Dane sa odbierane w potencjalnie duzych porcjach,
+            // dlatego jest możliwe, że w tej części będzie odebrany początek audio
+            buffer.resize(BIG_BUF);
+            std::string headers = "";
+            std::string leftover_audio = "";
             bool in_headers = true;
             bool checked_start = false;
             while (in_headers) {
-                char c;
-                ssize_t res = conn->read(&c, 1);
+                ssize_t res = conn->read(buffer.data(), buffer.size());
                 if (res < 0) {
-                    if (errno == EINTR || errno == EAGAIN) continue;
-                    throw std::system_error(
-                        errno, std::generic_category(),
-                        "header read");  // TODO: troche inaczej bo TLS nie
-                                         // rzuca errno
+                    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK){
+                        log(NONCRITICAL_ERROR, "Noncritical socket error: " + std::string(strerror(errno)));
+                        continue;
+                    }
+                    throw std::system_error(errno, std::generic_category(), "header read");
                 }
+                // Serwer zakończył połączenie -> zwracamy zero
                 if (res == 0) {
                     end_program = true;
                     return nullptr;
                 }
-                buffer += c;
 
-                //
-                if (!checked_start && buffer.length() >= 4) {
+                headers.append(buffer.data(), res);
+
+                // Sprawdzenie początku odpowiedzi - wstępne odrzucenie nieprawidłowych odpowiedzi serwera
+                if (!checked_start && headers.length() >= 4) {
                     checked_start = true;
-                    if (!(buffer.substr(0, 4) == "HTTP" ||
-                          buffer.substr(0, 3) == "ICY")) {
+                    if (!(headers.substr(0, 4) == "HTTP" ||
+                          headers.substr(0, 3) == "ICY")) {
                         throw std::runtime_error(
                             "Server did not send proper response");
                     }
                 }
 
-                // Nagłówki kończą się jeśli wystąpił podwójny koniec
-                if (buffer.length() >= 4 &&
-                    buffer.substr(buffer.length() - 4) == "\r\n\r\n") {
-                    in_headers = false;
+                // Nagłówki kończą się jeśli wystąpił podwójny \r\n
+                if (headers.length() >= 4){
+                    auto end_pos = headers.find("\r\n\r\n");
+                    if(end_pos != std::string::npos){
+                        in_headers = false;
+                        leftover_audio = headers.substr(end_pos + 4);
+                        headers.resize(end_pos+4);
+                    }
                 }
             }
 
-            log(LoggingLevel::COMMUNICATION, buffer);
-            HTTPResponse response = parse_http_response(buffer);
+            log(LoggingLevel::COMMUNICATION, headers);
+            HTTPResponse response = parse_http_response(headers);
 
             cookie_mgmt.update_from_response(response, url.host);
             if (response.status_code == 200) {
@@ -347,7 +365,7 @@ class RadioClient {
                 redirect = true;
                 continue;
             } else {
-                throw std::runtime_error("Serwer send unknown response code: " +
+                throw std::runtime_error("Server send unknown response code: " +
                                          std::to_string(response.status_code));
             }
 
@@ -365,6 +383,8 @@ class RadioClient {
             } else {
                 log(DIAGNOSTIC, "No metaint");
             }
+            chars_to_meta = meta_int;
+            parse_audio(leftover_audio.c_str(), leftover_audio.length());
         }
         return conn;
     }
@@ -378,6 +398,7 @@ class RadioClient {
     }
 
     void run() {
+        state = State::AUDIO;
         while (true) {
             auto conn = connection_start();
             if (end_program) return;
@@ -390,12 +411,6 @@ class RadioClient {
             fds[STDIN_FD].fd = STDIN_FILENO;
             fds[STDIN_FD].events = POLLIN;
             fds[STDIN_FD].revents = 0;
-
-            char buf_c[8192];  // FIXME: STAŁE i lepiej vector
-
-            chars_to_meta = meta_int;
-            state = State::AUDIO;
-            meta_buffer.clear(); //TODO: przy pozniejszych zmianach bedzie do usuniecia
 
             bool reconnect = false;
             end_program = false;
@@ -435,11 +450,11 @@ class RadioClient {
                 }
 
                 // Wejście od użytkownika
-                if (fds[1].fd != -1 && fds[1].revents != 0) {
-                    if (fds[1].revents & (POLLERR | POLLNVAL)) {
-                        fds[1].fd = -1;
-                    } else if (fds[1].revents & (POLLIN | POLLHUP)) {
-                        char buf[128]; //TODO: !!!
+                if (fds[STDIN_FD].fd != -1 && fds[1].revents != 0) {
+                    if (fds[STDIN_FD].revents & (POLLERR | POLLNVAL)) {
+                        fds[STDIN_FD].fd = -1;
+                    } else if (fds[STDIN_FD].revents & (POLLIN | POLLHUP)) {
+                        char buf[128];
                         ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
                         if (n > 0) {
                             stdin_buffer.append(buf, n);
@@ -453,15 +468,15 @@ class RadioClient {
                         } else if (n == 0) {
                             // zakończenie strumienia STDIN
                             log(DIAGNOSTIC, "stdin closed - EOF");
-                            fds[1].fd = -1;
+                            fds[STDIN_FD].fd = -1;
                         } else {
                             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                                 log(NONCRITICAL_ERROR, std::string("stdin error: ") + strerror(errno));
-                                fds[1].fd = -1;  // Błąd STDIN, kontynuujemy streaming
+                                fds[STDIN_FD].fd = -1;  // Błąd STDIN, kontynuujemy streaming
                             }
                         }
                     }
-                    fds[1].revents = 0;
+                    fds[STDIN_FD].revents = 0;
                 }
 
                 // audio
@@ -473,15 +488,18 @@ class RadioClient {
                     }
 
                     if ((fds[SERVER_FD].revents & POLLIN) || pending > 0) {
-                        ssize_t n = conn->read(buf_c, sizeof(buf_c));
+                        ssize_t n = conn->read(buffer.data(), buffer.size());
                         if (n == 0) {
                             log(CRITICAL_ERROR, "Server closed connection");
                             return;
                         } else if (n < 0) {
-                            if (errno == EINTR) continue;
-                            throw std::runtime_error("blad strumienia");  // TODO: errno?
+                            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK){
+                                log(NONCRITICAL_ERROR, "Noncritical socket error: " + std::string(strerror(errno)));
+                                continue;
+                            }    
+                            throw std::runtime_error("Socket error: " + std::string(strerror(errno)));
                         } else {
-                            parse_audio(buf_c, n);
+                            parse_audio(buffer.data(), n);
                             last_network_activity = std::chrono::steady_clock::now();
                         }
                     }

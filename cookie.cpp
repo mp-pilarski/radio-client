@@ -1,19 +1,16 @@
-#include "cookie.h"
-
 #include <algorithm>
 #include <chrono>
 #include <map>
 #include <string>
 #include <vector>
-
-#include "common.h"
-
-#include <iostream> //TODO: do usuniecia
 #include <sstream>
 
-SiteInfo parse_url(std::string& url){
+#include "common.h"
+#include "cookie.h"
+
+
+SiteInfo parse_url(const std::string& url){
     SiteInfo result;
-    //TODO: usprawnić! + szerszy error handling!
 
     // Fragment po # jest zignorowany
     std::string temp = url;
